@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 /* =====================================================================
- *  deadman — operator-presence (handle) safety switch on A0 / PA0.
+ *  deadman — operator-presence (handle) safety switch on PE7.
  *  Spec FR1 (assist only with operator presence) and FR3 (safe state when
  *  the operator releases the handle).
  *

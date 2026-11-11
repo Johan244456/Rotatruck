@@ -4,7 +4,8 @@
  *
  *  ODrive S1 branch: the previous PWM/encoder MSP entries are removed
  *  because the BLD300B is gone — all motor control now goes over CAN.
- *  Only FDCAN, I2C (IMU/LCD), USART (debug), and simple GPIO UI remain.
+ *  Only I2C (IMU/LCD), USART (debug), and simple GPIO UI remain
+ *  (the CAN MSP lives in odrive_can.c).
  */
 
 #include "stm32g4xx_hal.h"
@@ -12,45 +13,7 @@
 
 extern void Error_Handler(void);   /* defined in main.c */
 
-/* =====================================================================
- *  FDCAN MSP — ODrive CAN bus on PA11 (RX) / PA12 (TX)
- *
- *  FDCAN1 kernel clock on STM32G4 defaults to PCLK1 (= 170 MHz on this
- *  board), which is what the bit-timing constants in board.h assume.
- *  If the clock source is reconfigured elsewhere (e.g. PLL1Q via
- *  RCC PeriphCLKConfig), the bit timing must be recomputed.
- * =====================================================================*/
-void HAL_FDCAN_MspInit(FDCAN_HandleTypeDef *hfdcan)
-{
-    if (hfdcan->Instance != ODRIVE_CAN_INSTANCE) return;
-
-    /* Select the FDCAN kernel clock source.  This is NOT optional: the
-     * RCC FDCANSEL mux resets to HSE, and this board has no HSE (HSI-only
-     * clock tree), so without this the peripheral has no kernel clock and
-     * the CAN core can't generate or sample a single bit — HAL_FDCAN_Init
-     * still succeeds (APB registers only) but the bus is dead. */
-    RCC_PeriphCLKInitTypeDef periph = {0};
-    periph.PeriphClockSelection = RCC_PERIPHCLK_FDCAN;
-    periph.FdcanClockSelection  = RCC_FDCANCLKSOURCE_PCLK1;
-    if (HAL_RCCEx_PeriphCLKConfig(&periph) != HAL_OK) {
-        Error_Handler();
-    }
-
-    __HAL_RCC_FDCAN_CLK_ENABLE();
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-
-    GPIO_InitTypeDef g = {0};
-    g.Mode      = GPIO_MODE_AF_PP;
-    g.Pull      = GPIO_NOPULL;
-    g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
-    g.Alternate = ODRIVE_CAN_GPIO_AF;
-
-    g.Pin = ODRIVE_CAN_TX_PIN;  HAL_GPIO_Init(ODRIVE_CAN_TX_PORT, &g);
-    g.Pin = ODRIVE_CAN_RX_PIN;  HAL_GPIO_Init(ODRIVE_CAN_RX_PORT, &g);
-
-    HAL_NVIC_SetPriority(ODRIVE_CAN_IRQn, 5, 0);
-    HAL_NVIC_EnableIRQ(ODRIVE_CAN_IRQn);
-}
+/* CAN MSP (CAN2 on PB12/PB13) is HAL_CAN_MspInit in odrive_can.c. */
 
 /* =====================================================================
  *  I2C MSP — ISM330DHCX IMU + 16x2 LCD share I2C1

@@ -24,7 +24,7 @@
 void motorControlSetup(void)
 {
     if (!odriveCanInit()) {
-        uart_print("ODrive CAN init FAILED — check FDCAN MSP + transceiver.\r\n");
+        uart_print("ODrive CAN init FAILED — check transceiver 5V power + PB12/PB13 wiring.\r\n");
         return;
     }
     uart_print("ODrive CAN init OK — waiting for first heartbeat...\r\n");

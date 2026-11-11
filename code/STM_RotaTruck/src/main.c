@@ -4,7 +4,7 @@
  *  two ODrive S1 boards over a shared CAN bus.
  *
  *  Target : Nucleo-G491RE (STM32G491RET6 @ 170 MHz)
- *  CAN    : FDCAN1 on PA11 (RX) / PA12 (TX), 250 kbit/s, classic frames
+ *  CAN    : CAN2 on PB12 (RX) / PB13 (TX), 250 kbit/s, classic frames
  *           Requires an external transceiver (e.g. SN65HVD230) — see
  *           docs/02_branch/ODRIVE_INTEGRATION.md for the wiring diagram.
  *  Sensors: ISM330DHCX IMU on I2C1 (PB8/PB9),
@@ -12,7 +12,7 @@
  *  UI     : 16x2 LCD on same I2C1 bus; payload +/- buttons on PB6/PC7
  *           (manual fallback), assist toggle on PA9 (D8) and the on-board
  *           USER button PC13.
- *  Safety : handle (dead-man) switch on A0 / PA0 - released = wheels ramp
+ *  Safety : handle (dead-man) switch on PE7 - released = wheels ramp
  *           down to 0 and are held (deadman.c, assist_control.c).
  *  Debug  : USART2 via the ST-Link VCP, 115200 8N1.
  */
@@ -66,7 +66,7 @@ int main(void)
                ? "LCD: 16x2 I2C display detected.\r\n"
                : "LCD: not detected (check I2C address/wiring on D14/D15).\r\n");
 
-    /* Handle (dead-man) safety switch on A0 - before the pose machine, which
+    /* Handle (dead-man) safety switch on PE7 - before the pose machine, which
      * ramps the wheels to a stop whenever it reads released. */
     deadmanSetup();
 
@@ -102,7 +102,7 @@ int main(void)
         buttonPoll();       /* B1 press toggles assist enabled / disabled    */
         observerUpdate();   /* refreshes IMU + force estimate (self-throttled to ~100 Hz) */
         loadcellUpdate();   /* HX711s when ready (10 Hz) + load pose, non-blocking */
-        deadmanPoll();      /* handle safety switch (A0), debounced          */
+        deadmanPoll();      /* handle safety switch (PE7), debounced         */
         assistUpdate();     /* pose detect + brake/release / release-stop ramp */
         autoseqUpdate();    /* autonomous self-calibrate + arm on drive-entry */
         modeInputUpdate();  /* payload +/- buttons, D8 assist toggle       */

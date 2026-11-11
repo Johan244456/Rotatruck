@@ -2,7 +2,7 @@
 #define ODRIVE_CAN_H
 
 /* =====================================================================
- *  odrive_can.h — minimal ODrive S1 CAN driver for STM32G4 FDCAN.
+ *  odrive_can.h — minimal ODrive S1 CAN driver for STM32F4 bxCAN (CAN2).
  *
  *  Protocol reference:
  *    https://docs.odriverobotics.com/v/latest/manual/can-protocol.html
@@ -18,8 +18,8 @@
  *  current).  See docs/ODRIVE_INTEGRATION.md for usage notes.
  *
  *  Hardware:
- *    FDCAN1 on PA11/PA12 via external transceiver (SN65HVD230 or similar).
- *    Bit timing in board.h.  Default baud is 250 kbit/s.
+ *    CAN2 on PB12 (RX) / PB13 (TX) via external transceiver (TJA-series,
+ *    powered from 5V).  Bit timing in board.h.  Default baud is 250 kbit/s.
  * =====================================================================*/
 
 #include <stdbool.h>
@@ -98,9 +98,15 @@ typedef struct {
  *  Lifecycle
  * ---------------------------------------------------------------------*/
 
-/* Initialise FDCAN1 and start listening for ODrive frames.
- * Call once after SystemClock_Config().  Returns true on success. */
+/* Initialise CAN2 and start listening for ODrive frames.
+ * Call once after SystemClock_Config() (needs PCLK1 = 42 MHz).
+ * Returns true on success; false if the clock is wrong or PB12 never
+ * sees an idle bus (transceiver unpowered / RX wire off). */
 bool  odriveCanInit(void);
+
+/* Controller error counters (TEC/REC) and bus-off flag, for diagnostics.
+ * Any pointer may be NULL.  All zero before a successful init. */
+void  odriveCanGetBusStatus(uint8_t *tec, uint8_t *rec, bool *bus_off);
 
 /* Number of node IDs we track.  Currently 2 (left + right wheel). */
 #define ODRIVE_NUM_NODES        2
@@ -163,7 +169,7 @@ bool  odriveEstop(uint8_t node_id);
 void  odriveStopAll(void);
 
 /* ---------------------------------------------------------------------
- *  ISR hook — wire from stm32g4xx_it.c::FDCAN1_IT0_IRQHandler.
+ *  ISR hook — call from CAN2_RX0_IRQHandler.
  * ---------------------------------------------------------------------*/
 void  odriveCanRxISR(void);
 

@@ -16,7 +16,7 @@
 #include "board.h"
 #include "command.h"          /* uart_print / uart_printf */
 #include "ism330.h"
-#include "stm32g4xx_hal.h"
+#include "stm32f4xx_hal.h"
 #include <string.h>
 #include <math.h>
 
@@ -82,17 +82,16 @@ static void i2c_bus_clear_pins(void)
 static bool i2c_peripheral_init(void)
 {
     hi2c_imu.Instance              = IMU_I2C_INSTANCE;
-    hi2c_imu.Init.Timing           = IMU_I2C_TIMING;
-    hi2c_imu.Init.OwnAddress1      = 0;
-    hi2c_imu.Init.AddressingMode   = I2C_ADDRESSINGMODE_7BIT;
-    hi2c_imu.Init.DualAddressMode  = I2C_DUALADDRESS_DISABLE;
-    hi2c_imu.Init.OwnAddress2      = 0;
-    hi2c_imu.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
-    hi2c_imu.Init.GeneralCallMode  = I2C_GENERALCALL_DISABLE;
-    hi2c_imu.Init.NoStretchMode    = I2C_NOSTRETCH_DISABLE;
+    hi2c_imu.Init.ClockSpeed      = IMU_I2C_CLOCK_HZ;
+    hi2c_imu.Init.DutyCycle       = I2C_DUTYCYCLE_2;
+    hi2c_imu.Init.OwnAddress1     = 0;
+    hi2c_imu.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
+    hi2c_imu.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c_imu.Init.OwnAddress2     = 0;
+    hi2c_imu.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c_imu.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
     if (HAL_I2C_Init(&hi2c_imu) != HAL_OK) return false;
-    HAL_I2CEx_ConfigAnalogFilter(&hi2c_imu, I2C_ANALOGFILTER_ENABLE);
-    HAL_I2CEx_ConfigDigitalFilter(&hi2c_imu, 0);
+    /* (The F407's I2C has no configurable analog/digital noise filter.) */
     return true;
 }
 

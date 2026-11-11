@@ -1,11 +1,11 @@
 /*
- *  deadman.c — handle safety switch on A0 (PA0).  See deadman.h.
+ *  deadman.c — handle safety switch on PE7.  See deadman.h.
  */
 
 #include "deadman.h"
 #include "board.h"
 #include "command.h"
-#include "stm32g4xx_hal.h"
+#include "stm32f4xx_hal.h"
 
 static bool          s_pressed = false;      /* debounced state, starts RELEASED (safe) */
 static GPIO_PinState s_raw_last;
@@ -23,6 +23,7 @@ static bool level_is_pressed(GPIO_PinState level)
 void deadmanSetup(void)
 {
 #if DEADMAN_ENABLE
+    __HAL_RCC_GPIOE_CLK_ENABLE();   /* PE7 - main() only enables GPIOA..C */
     GPIO_InitTypeDef g = {0};
     g.Pin   = DEADMAN_PIN;
     g.Mode  = GPIO_MODE_INPUT;
@@ -39,7 +40,7 @@ void deadmanSetup(void)
     s_raw_last  = HAL_GPIO_ReadPin(DEADMAN_PORT, DEADMAN_PIN);
     s_change_ms = HAL_GetTick();
     s_pressed   = false;                      /* must be seen pressed first */
-    uart_printf("SAFETY: handle switch on A0 (PA0), %s - %s now.\r\n",
+    uart_printf("SAFETY: handle switch on PE7, %s - %s now.\r\n",
                 DEADMAN_ACTIVE_LOW ? "active-low" : "active-high",
                 level_is_pressed(s_raw_last) ? "PRESSED" : "RELEASED");
 #else

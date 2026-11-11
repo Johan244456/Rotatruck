@@ -1,5 +1,9 @@
 /*
- *  odrive_can.c — minimal STM32G4 FDCAN driver for the ODrive S1.
+ *  odrive_can.c — minimal STM32F4 bxCAN (CAN2) driver for the ODrive S1.
+ *
+ *  Ported from the Nucleo-G4 FDCAN1 version: only the low-level send /
+ *  init / receive code changed; the ODrive protocol layer is unchanged.
+ *  Pins + bit timing in board.h (CAN2, PB12 = RX, PB13 = TX, 250 kbit/s).
  *
  *  All ODrive command + feedback IDs match the protocol documented at
  *  https://docs.odriverobotics.com/v/latest/manual/can-protocol.html
@@ -8,7 +12,7 @@
 
 #include "odrive_can.h"
 #include "board.h"
-#include "stm32g4xx_hal.h"
+#include "stm32f4xx_hal.h"
 
 #include <string.h>
 
@@ -32,15 +36,15 @@
 #define ODRV_CMD_CLEAR_ERRORS           0x018
 
 /* The RTR (remote-transmission-request) bit is the way ODrive expects
- * a "please reply with the latest value" message.  HAL FDCAN exposes
- * this via FDCAN_DATA_FRAME vs FDCAN_REMOTE_FRAME.  Only
+ * a "please reply with the latest value" message.  HAL CAN exposes
+ * this via CAN_RTR_DATA vs CAN_RTR_REMOTE.  Only
  * odriveRequestBusVI() uses rtr=true; all setpoint commands are data
  * frames. */
 
 /* ---------------------------------------------------------------------
  *  Module state
  * ---------------------------------------------------------------------*/
-static FDCAN_HandleTypeDef hfdcan;
+static CAN_HandleTypeDef   hcan;
 static odrive_state_t      s_states[ODRIVE_NUM_NODES];
 static uint8_t             s_tracked_nodes[ODRIVE_NUM_NODES] = {
     ODRIVE_NODE_ID_LEFT,
@@ -119,52 +123,36 @@ static bool can_send(uint8_t node_id, uint16_t cmd_id,
     if (!s_ready) return false;
     if (len > 8) return false;
 
-    FDCAN_TxHeaderTypeDef tx = {0};
-    tx.Identifier          = build_can_id(node_id, cmd_id);
-    tx.IdType              = FDCAN_STANDARD_ID;
-    tx.TxFrameType         = rtr ? FDCAN_REMOTE_FRAME : FDCAN_DATA_FRAME;
-    /* HAL encodes data length as FDCAN_DLC_BYTES_n constants, not a raw
-     * byte count, so map explicitly. */
-    switch (len) {
-        case 0: tx.DataLength = FDCAN_DLC_BYTES_0; break;
-        case 1: tx.DataLength = FDCAN_DLC_BYTES_1; break;
-        case 2: tx.DataLength = FDCAN_DLC_BYTES_2; break;
-        case 3: tx.DataLength = FDCAN_DLC_BYTES_3; break;
-        case 4: tx.DataLength = FDCAN_DLC_BYTES_4; break;
-        case 5: tx.DataLength = FDCAN_DLC_BYTES_5; break;
-        case 6: tx.DataLength = FDCAN_DLC_BYTES_6; break;
-        case 7: tx.DataLength = FDCAN_DLC_BYTES_7; break;
-        case 8: tx.DataLength = FDCAN_DLC_BYTES_8; break;
-    }
-    tx.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    tx.BitRateSwitch       = FDCAN_BRS_OFF;
-    /* Classic CAN frames (not CAN-FD) — the ODrive S1 speaks classic CAN. */
-    tx.FDFormat            = FDCAN_CLASSIC_CAN;
-    tx.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
-    tx.MessageMarker       = 0;
+    CAN_TxHeaderTypeDef tx = {0};
+    tx.StdId              = build_can_id(node_id, cmd_id);
+    tx.IDE                = CAN_ID_STD;
+    tx.RTR                = rtr ? CAN_RTR_REMOTE : CAN_RTR_DATA;
+    tx.DLC                = len;
+    tx.TransmitGlobalTime = DISABLE;
 
     uint8_t payload[8] = {0};
     if (data && len > 0) {
         memcpy(payload, data, len);
     }
 
-    /* The STM32G4 FDCAN TX FIFO is only 3 elements deep.  Several call
-     * sites (e.g. the arm sequence) queue 4+ frames back-to-back in a few
-     * microseconds, far faster than the ~0.43 ms it takes to transmit one
-     * at 250 kbit/s.  Without this wait the FIFO fills and the 4th frame —
-     * which happens to be Set_Axis_State(CLOSED_LOOP) — is silently
-     * dropped, leaving the axis stuck in IDLE with no error.  Block
-     * briefly for a free slot.  On a healthy bus a slot frees within a
-     * frame time; the 10 ms cap just stops us hanging if the bus is dead. */
+    /* bxCAN has only 3 TX mailboxes.  Several call sites (e.g. the arm
+     * sequence) queue 4+ frames back-to-back in a few microseconds, far
+     * faster than the ~0.43 ms it takes to transmit one at 250 kbit/s.
+     * Without this wait the mailboxes fill and the 4th frame — which
+     * happens to be Set_Axis_State(CLOSED_LOOP) — is silently dropped,
+     * leaving the axis stuck in IDLE with no error.  Block briefly for a
+     * free mailbox.  On a healthy bus one frees within a frame time; the
+     * 10 ms cap just stops us hanging if the bus is dead. */
     uint32_t t0 = HAL_GetTick();
-    while (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan) == 0) {
+    while (HAL_CAN_GetTxMailboxesFreeLevel(&hcan) == 0) {
         if ((uint32_t)(HAL_GetTick() - t0) > 10U) {
             return false;   /* bus stuck / not being ACKed */
         }
     }
 
-    if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan, &tx, payload) != HAL_OK) {
-        /* TX FIFO full or peripheral fault — caller can retry. */
+    uint32_t mailbox;
+    if (HAL_CAN_AddTxMessage(&hcan, &tx, payload, &mailbox) != HAL_OK) {
+        /* no free mailbox or peripheral fault — caller can retry. */
         return false;
     }
     return true;
@@ -177,53 +165,96 @@ static bool can_send(uint8_t node_id, uint16_t cmd_id,
 bool odriveCanInit(void)
 {
     memset(s_states, 0, sizeof s_states);
+    s_ready = false;
 
-    hfdcan.Instance                  = ODRIVE_CAN_INSTANCE;
-    hfdcan.Init.ClockDivider         = FDCAN_CLOCK_DIV1;
-    hfdcan.Init.FrameFormat          = FDCAN_FRAME_CLASSIC;
-    hfdcan.Init.Mode                 = FDCAN_MODE_NORMAL;
-    hfdcan.Init.AutoRetransmission   = ENABLE;
-    hfdcan.Init.TransmitPause        = DISABLE;
-    hfdcan.Init.ProtocolException    = DISABLE;
-    hfdcan.Init.NominalPrescaler     = ODRIVE_CAN_NOMINAL_PRESCALER;
-    hfdcan.Init.NominalSyncJumpWidth = ODRIVE_CAN_NOMINAL_SJW;
-    hfdcan.Init.NominalTimeSeg1      = ODRIVE_CAN_NOMINAL_TIME_SEG1;
-    hfdcan.Init.NominalTimeSeg2      = ODRIVE_CAN_NOMINAL_TIME_SEG2;
-    /* Data-phase fields don't matter in CLASSIC frame format but HAL
-     * still wants them initialised to legal values. */
-    hfdcan.Init.DataPrescaler        = ODRIVE_CAN_NOMINAL_PRESCALER;
-    hfdcan.Init.DataSyncJumpWidth    = ODRIVE_CAN_NOMINAL_SJW;
-    hfdcan.Init.DataTimeSeg1         = ODRIVE_CAN_NOMINAL_TIME_SEG1;
-    hfdcan.Init.DataTimeSeg2         = ODRIVE_CAN_NOMINAL_TIME_SEG2;
-    hfdcan.Init.StdFiltersNbr        = 1;
-    hfdcan.Init.ExtFiltersNbr        = 0;
-    hfdcan.Init.TxFifoQueueMode      = FDCAN_TX_FIFO_OPERATION;
-
-    if (HAL_FDCAN_Init(&hfdcan) != HAL_OK) return false;
-
-    /* Accept every standard-frame ID into RX FIFO 0.  We'll filter by
-     * node_id in software since both ODrives share the same bus. */
-    FDCAN_FilterTypeDef f = {0};
-    f.IdType       = FDCAN_STANDARD_ID;
-    f.FilterIndex  = 0;
-    f.FilterType   = FDCAN_FILTER_MASK;
-    f.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-    f.FilterID1    = 0x000;
-    f.FilterID2    = 0x000;            /* mask = 0 → accept-all */
-    HAL_FDCAN_ConfigFilter(&hfdcan, &f);
-
-    HAL_FDCAN_ConfigGlobalFilter(&hfdcan,
-                                 FDCAN_REJECT, FDCAN_REJECT,
-                                 FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE);
-
-    if (HAL_FDCAN_ActivateNotification(&hfdcan,
-            FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0) != HAL_OK) {
+    /* The bit timing in board.h is only right for one PCLK1.  A wrong
+     * clock gives a wrong baud rate and a bus full of error frames, so
+     * refuse to start rather than disturb the ODrives. */
+    if (HAL_RCC_GetPCLK1Freq() != ODRIVE_CAN_PCLK1_HZ) {
+        uart_print("CAN: PCLK1 is not 42 MHz - fix the bit timing in board.h.\r\n");
         return false;
     }
-    if (HAL_FDCAN_Start(&hfdcan) != HAL_OK) return false;
+
+    hcan.Instance                  = ODRIVE_CAN_INSTANCE;
+    hcan.Init.Prescaler            = ODRIVE_CAN_PRESCALER;
+    hcan.Init.Mode                 = CAN_MODE_NORMAL;
+    hcan.Init.SyncJumpWidth        = ODRIVE_CAN_SJW;
+    hcan.Init.TimeSeg1             = ODRIVE_CAN_BS1;
+    hcan.Init.TimeSeg2             = ODRIVE_CAN_BS2;
+    hcan.Init.TimeTriggeredMode    = DISABLE;
+    hcan.Init.AutoBusOff           = ENABLE;   /* recover from bus-off by itself */
+    hcan.Init.AutoWakeUp           = DISABLE;
+    hcan.Init.AutoRetransmission   = ENABLE;
+    hcan.Init.ReceiveFifoLocked    = DISABLE;  /* overwrite oldest on overrun */
+    /* Send in the order queued, not by lowest ID.  Default bxCAN priority
+     * is by identifier, which could reorder e.g. Set_Controller_Mode (0x0B)
+     * after Set_Axis_State (0x07) within the arm sequence. */
+    hcan.Init.TransmitFifoPriority = ENABLE;
+
+    if (HAL_CAN_Init(&hcan) != HAL_OK) return false;
+
+    /* Accept every standard-frame ID into RX FIFO 0.  We'll filter by
+     * node_id in software since both ODrives share the same bus.
+     * CAN2 owns banks ODRIVE_CAN_FILTER_BANK..27 (HAL writes CAN2SB into
+     * CAN1's filter registers, hence the CAN1 clock in the MSP). */
+    CAN_FilterTypeDef f = {0};
+    f.FilterBank           = ODRIVE_CAN_FILTER_BANK;
+    f.SlaveStartFilterBank = ODRIVE_CAN_FILTER_BANK;
+    f.FilterMode           = CAN_FILTERMODE_IDMASK;
+    f.FilterScale          = CAN_FILTERSCALE_32BIT;
+    f.FilterIdHigh         = 0x0000;
+    f.FilterIdLow          = 0x0000;
+    f.FilterMaskIdHigh     = 0x0000;   /* mask = 0 → accept-all */
+    f.FilterMaskIdLow      = 0x0000;
+    f.FilterFIFOAssignment = CAN_RX_FIFO0;
+    f.FilterActivation     = ENABLE;
+    if (HAL_CAN_ConfigFilter(&hcan, &f) != HAL_OK) return false;
+
+    /* HAL_CAN_Start waits (10 ms) for 11 recessive bits on RX.  It fails
+     * if PB12 never sees an idle bus — usually an unpowered transceiver. */
+    if (HAL_CAN_Start(&hcan) != HAL_OK) return false;
+    if (HAL_CAN_ActivateNotification(&hcan,
+            CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
+        return false;
+    }
 
     s_ready = true;
     return true;
+}
+
+void odriveCanGetBusStatus(uint8_t *tec, uint8_t *rec, bool *bus_off)
+{
+    uint32_t esr = s_ready ? hcan.Instance->ESR : 0U;
+    if (tec)     *tec     = (uint8_t)((esr & CAN_ESR_TEC) >> CAN_ESR_TEC_Pos);
+    if (rec)     *rec     = (uint8_t)((esr & CAN_ESR_REC) >> CAN_ESR_REC_Pos);
+    if (bus_off) *bus_off = (esr & CAN_ESR_BOFF) != 0U;
+}
+
+/* ---------------------------------------------------------------------
+ *  MSP — clocks, pins, NVIC.  Kept here (not in a *_hal_msp.c) so the
+ *  driver is self-contained in every build env.
+ * ---------------------------------------------------------------------*/
+void HAL_CAN_MspInit(CAN_HandleTypeDef *h)
+{
+    if (h->Instance != ODRIVE_CAN_INSTANCE) return;
+
+    __HAL_RCC_CAN1_CLK_ENABLE();   /* CAN2 needs CAN1's clock (shared filters) */
+    __HAL_RCC_CAN2_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    GPIO_InitTypeDef g = {0};
+    g.Mode      = GPIO_MODE_AF_PP;
+    /* No internal pull: a 5 V transceiver drives RX above VDD, and the
+     * pull-up must stay off on a 5 V-tolerant pin when that happens. */
+    g.Pull      = GPIO_NOPULL;
+    g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    g.Alternate = ODRIVE_CAN_GPIO_AF;
+
+    g.Pin = ODRIVE_CAN_TX_PIN;  HAL_GPIO_Init(ODRIVE_CAN_TX_PORT, &g);
+    g.Pin = ODRIVE_CAN_RX_PIN;  HAL_GPIO_Init(ODRIVE_CAN_RX_PORT, &g);
+
+    HAL_NVIC_SetPriority(ODRIVE_CAN_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(ODRIVE_CAN_IRQn);
 }
 
 /* ---------------------------------------------------------------------
@@ -335,7 +366,7 @@ void odriveStopAll(void)
 }
 
 /* ---------------------------------------------------------------------
- *  RX path — called from the FDCAN1 interrupt
+ *  RX path — called from the CAN2 RX0 interrupt
  * ---------------------------------------------------------------------*/
 
 static void handle_rx(uint32_t can_id, const uint8_t *data, uint8_t len)
@@ -394,37 +425,24 @@ static void handle_rx(uint32_t can_id, const uint8_t *data, uint8_t len)
 
 void odriveCanRxISR(void)
 {
-    HAL_FDCAN_IRQHandler(&hfdcan);
+    HAL_CAN_IRQHandler(&hcan);
 }
 
-/* HAL invokes this from inside HAL_FDCAN_IRQHandler when RX FIFO 0 has
+/* HAL invokes this from inside HAL_CAN_IRQHandler when RX FIFO 0 has
  * at least one pending message.  Pull every available frame so we never
- * leave the FIFO non-empty (which would mask the interrupt). */
-void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hf, uint32_t flags)
+ * leave the FIFO non-empty. */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *h)
 {
-    if (hf->Instance != ODRIVE_CAN_INSTANCE) return;
-    if (!(flags & FDCAN_IT_RX_FIFO0_NEW_MESSAGE)) return;
+    if (h->Instance != ODRIVE_CAN_INSTANCE) return;
 
-    while (HAL_FDCAN_GetRxFifoFillLevel(hf, FDCAN_RX_FIFO0) > 0) {
-        FDCAN_RxHeaderTypeDef rx;
+    while (HAL_CAN_GetRxFifoFillLevel(h, CAN_RX_FIFO0) > 0) {
+        CAN_RxHeaderTypeDef rx;
         uint8_t buf[8] = {0};
-        if (HAL_FDCAN_GetRxMessage(hf, FDCAN_RX_FIFO0, &rx, buf) != HAL_OK) {
+        if (HAL_CAN_GetRxMessage(h, CAN_RX_FIFO0, &rx, buf) != HAL_OK) {
             break;
         }
-        /* HAL stores DLC in the same len<<16 encoding; decode by table. */
-        uint8_t len = 0;
-        switch (rx.DataLength) {
-            case FDCAN_DLC_BYTES_0: len = 0; break;
-            case FDCAN_DLC_BYTES_1: len = 1; break;
-            case FDCAN_DLC_BYTES_2: len = 2; break;
-            case FDCAN_DLC_BYTES_3: len = 3; break;
-            case FDCAN_DLC_BYTES_4: len = 4; break;
-            case FDCAN_DLC_BYTES_5: len = 5; break;
-            case FDCAN_DLC_BYTES_6: len = 6; break;
-            case FDCAN_DLC_BYTES_7: len = 7; break;
-            case FDCAN_DLC_BYTES_8: len = 8; break;
-            default: len = 0; break;
-        }
-        handle_rx(rx.Identifier, buf, len);
+        /* ODrive feedback is always standard-ID data frames. */
+        if (rx.IDE != CAN_ID_STD || rx.RTR != CAN_RTR_DATA) continue;
+        handle_rx(rx.StdId, buf, (uint8_t)(rx.DLC > 8 ? 8 : rx.DLC));
     }
 }

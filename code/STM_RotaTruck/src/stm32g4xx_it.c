@@ -3,7 +3,7 @@
  *
  *  Active IRQs:
  *    - SysTick      : HAL_Delay / HAL_GetTick timebase
- *    - FDCAN1_IT0   : ODrive CAN RX (heartbeats + feedback)
+ *    - CAN2_RX0     : ODrive CAN RX (heartbeats + feedback)
  *    - USART2       : debug VCP RX bytes for the command parser
  *
  *  Fault handlers (HardFault/NMI/etc.) are not defined here — the
@@ -24,8 +24,8 @@ void SysTick_Handler(void)
     HAL_IncTick();
 }
 
-/* FDCAN1 main interrupt line — RX FIFO 0 plus most other status bits. */
-void FDCAN1_IT0_IRQHandler(void)
+/* CAN2 RX FIFO 0 interrupt — ODrive heartbeats + feedback. */
+void CAN2_RX0_IRQHandler(void)
 {
     odriveCanRxISR();
 }

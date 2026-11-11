@@ -22,7 +22,7 @@ extern "C" {
  *  rather than negating here.
  * =====================================================================*/
 
-/* Init: bring up FDCAN1 and enable the ODrive RX path.  Does NOT take
+/* Init: bring up CAN2 and enable the ODrive RX path.  Does NOT take
  * the motors out of IDLE — call motorControlEnableClosedLoop() once you
  * actually want them to move. */
 void motorControlSetup(void);
