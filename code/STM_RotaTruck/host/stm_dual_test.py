@@ -101,7 +101,10 @@ def start_window():
     port_box.grid(row=1, column=1, sticky="we", pady=4)
 
     def refresh():
-        ports = [(p.device, p.description) for p in list_ports.comports()]
+        # F407 Discovery: console over RTT (tools/rtt_server.sh), listed first
+        ports = [("socket://localhost:9090",
+                  "STM32F407 Discovery over RTT (start tools/rtt_server.sh first)")] \
+                + [(p.device, p.description) for p in list_ports.comports()]
         port_box["values"] = [f"{d}  -  {desc}" for d, desc in ports]
         want = last.get("port")
         pick = next((f"{d}  -  {desc}" for d, desc in ports if d == want), None)

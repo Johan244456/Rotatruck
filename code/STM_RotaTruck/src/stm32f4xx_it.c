@@ -15,7 +15,7 @@
  *  are read off the ODrive over CAN now.
  */
 
-#include "stm32g4xx_hal.h"
+#include "stm32f4xx_hal.h"
 #include "odrive_can.h"
 #include "command.h"
 
@@ -34,4 +34,10 @@ void CAN2_RX0_IRQHandler(void)
 void USART2_IRQHandler(void)
 {
     commandUartISR();
+}
+
+/* No output channel survives a hard fault; spin so the debugger can see it. */
+void HardFault_Handler(void)
+{
+    while (1) { }
 }

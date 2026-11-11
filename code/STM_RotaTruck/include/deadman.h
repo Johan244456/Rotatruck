@@ -2,6 +2,7 @@
 #define DEADMAN_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,6 +27,12 @@ extern "C" {
 void deadmanSetup(void);
 void deadmanPoll(void);          /* every main-loop pass */
 bool deadmanPressed(void);       /* debounced; always true if DEADMAN_ENABLE is 0 */
+
+/* Gestures (board.h DEADMAN_HOLD_MS / DEADMAN_CLICK_*). */
+bool     deadmanHeld(void);                 /* pressed for >= DEADMAN_HOLD_MS          */
+uint32_t deadmanPressStartMs(void);         /* HAL tick of the current / last press    */
+bool     deadmanTakeTripleClick(uint32_t *first_press_ms);   /* once per triple click  */
+uint8_t  deadmanTakeShortClicks(void);      /* 1-2 quick clicks that ended, once (0 = none) */
 
 #ifdef __cplusplus
 }

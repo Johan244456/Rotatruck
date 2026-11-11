@@ -2,7 +2,7 @@
 #include "admittance.h"
 #include "board.h"
 #include "payload.h"
-#include "stm32g4xx_hal.h"
+#include "stm32f4xx_hal.h"
 
 #include <stdbool.h>
 
@@ -89,6 +89,9 @@ static void setup_button_gpio(Button *button)
 
 void modeInputSetup(void)
 {
+#if !UI_BUTTONS_ENABLE
+    return;                    /* board.h: not wired on the DISC1 yet */
+#endif
     for (unsigned i = 0; i < BUTTON_COUNT; i++) {
         setup_button_gpio(&s_buttons[i]);
     }
@@ -96,6 +99,9 @@ void modeInputSetup(void)
 
 void modeInputUpdate(void)
 {
+#if !UI_BUTTONS_ENABLE
+    return;
+#endif
     uint32_t now = HAL_GetTick();
     for (unsigned i = 0; i < BUTTON_COUNT; i++) {
         Button *b = &s_buttons[i];

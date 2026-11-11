@@ -19,7 +19,7 @@
  *     (faults, IMU lost) are printed, so normal telemetry stays quiet (NFR5).
  *   - Power-up: no 6 s diagnostic; a short presence check + tare only if no
  *     zero is saved, and a one-line summary.
- *   - Results only (status, 0.9 x measured).  Which value the assist uses,
+ *   - Results only (status, LOAD_ASSIST_SCALE x measured).  Which value the assist uses,
  *     and when, is decided in payload.c (latch on STANDING -> tipped back,
  *     manual buttons as the fallback).
  *
@@ -54,7 +54,7 @@
 #include "command.h"            /* [RT] uart_print */
 #include "imu.h"                /* [RT] shared IMU layer */
 #include "ism330.h"
-#include "stm32g4xx_hal.h"
+#include "stm32f4xx_hal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,9 +68,9 @@
 #define GAUGE_FACTOR      2.0f      /* from the gauge packet                   */
 #define R_GAUGE           350.0f
 #define R_COMP_DEFAULT    350.0f    /* CH1 completion pair, rig standard       */
-#define HX_AVDD           3.2f      /* HX711 VCC 3V3 -> about 3.2 V. 4.3 at 5 V */
+#define HX_AVDD           2.9f      /* [F4] HX711 VCC from the DISC1 3V pin (3.0 V) -> about 2.9 V (3.2 on 3V3, 4.3 at 5 V). Affects mV / ustrain readouts only; kg comes from the calibration */
 #define RATED_KG_DEFAULT  150.0f
-#define ASSIST_SF         0.9f      /* assist sized for 90 % of the load       */
+#define ASSIST_SF         LOAD_ASSIST_SCALE   /* board.h: fraction of the load given to the assist (0.7) */
 #define STAND_DEG         5.0f      /* within this of the standing pose = standing */
 #define TIP_DEG           15.0f     /* tilted back at least this = tipped back  */
 #define STILL_DPS         3.0f      /* gyro below this ...                      */
@@ -79,11 +79,24 @@
 #define UNCAL_USTR_PER_KG 3.0f      /* zero band before calibration (test 15, middle strip) */
 #define IMU_STALE_MS      100U      /* [RT] shared IMU sample older than this = missed */
 #define BOOT_TARE_N       10        /* [RT] samples per bridge for the power-up tare  */
+/* [F4] HX711 channel-A gain: 128 (+/-0.5*AVDD/128 = +/-11.3 mV at 2.9 V) or
+ * 64 (+/-22.7 mV).  Use 64 only if a bridge's resting offset is beyond the
+ * gain-128 range (raw stuck at +/-8388607): the bridge offset and the range
+ * both scale with the excitation, so a lower supply does not cure it.
+ * Microstrain / mV readouts follow this; recalibrate after changing it. */
+#define HX_GAIN           64        /* middle-strip bridge rests at ~-6 mV/V (-17.6 mV), beyond the gain-128 range */
+#define HX_WAKE_MS        600U      /* [F4] boot presence check: HX711 first conversion after wake-up */
 /* ========================================================================= */
 
+#if HX_GAIN == 128
 #define HX_GAIN_PULSES    25        /* channel A, gain 128                     */
+#elif HX_GAIN == 64
+#define HX_GAIN_PULSES    27        /* channel A, gain 64                      */
+#else
+#error "HX_GAIN must be 128 or 64"
+#endif
 #define HX_RAIL_WARN      8300000L
-#define HX_FS_MV          (0.5f * HX_AVDD / 128.0f * 1000.0f)
+#define HX_FS_MV          (0.5f * HX_AVDD / (float)HX_GAIN * 1000.0f)
 #define HX_COUNTS_PER_MV  (8388608.0f / HX_FS_MV)
 #define SAMPLE_PERIOD_S   0.10f     /* HX711 at 10 SPS                         */
 #define NO_DATA_MS        500U
@@ -167,7 +180,7 @@ static uint8_t  FILTER_MODE  = 1;                /* 1 stable-hold, 0 smooth     
 static const float FAST_TAU_S = 0.15f, FAST_HOLD_S = 1.5f, STABLE_WINDOW_S = 0.5f;
 static const uint8_t RELEASE_N = 3;
 static float    AZT_BAND_KG = 3.0f;
-static const float AZT_TIME_S = 3.0f, AZT_DEADZONE_KG = 0.05f, AZT_WARN_KG = 15.0f;
+static const float AZT_TIME_S = 3.0f, AZT_DEADZONE_KG = 0.05f, AZT_WARN_KG = 15.0f;   /* [F4] 3 s within the band */
 
 static float    emaVal; static uint8_t emaInit; static uint32_t fastUntilMs, snapCount;
 static float    shBuf[SH_MAX]; static uint8_t shIdx, shCount, shRelease, shHolding;
@@ -194,16 +207,41 @@ static uint8_t  imuOk, imuFound; static uint32_t imuLastMs; static uint8_t imuFa
 static float    aLP[3], gBias[3]; static uint8_t aInit;
 static float    refS[3], refRp[3];               /* standing gravity, tip-back direction */
 static float    tiltDeg, devDeg, tipLimDeg = TIP_DEG; static uint8_t pose = LP_UNKNOWN;
+static float    refR[3];                         /* [F4] tipped-back gravity direction (q r), unit */
+static float    restDevDeg = 180.0f;             /* [F4] degrees away from the full tipped-back pose */
 static uint32_t lastMoveMs; static uint8_t movedSinceRow = 1;
 
+/* [F4] Pose simulator for bench tests without an IMU - built ONLY into
+ * env:loadcell_test (-DLC_POSE_SIM=1), never into the motor firmware, which
+ * must not trust a fake pose.  'q f s' standing, 'q f r' tipped back (moving
+ * for 1 s, then still), 'q f t' tilting, 'q f 0' back to the real IMU.  RAM
+ * only, not saved.  Pose gating, rest zero, HELD and the dashboard's pose
+ * checks then behave exactly as with the IMU. */
+#ifndef LC_POSE_SIM
+#define LC_POSE_SIM 0
+#endif
+#if LC_POSE_SIM
+static uint8_t  simPose;                         /* 0 = off, else LP_STANDING / LP_TILTING / LP_TIPPED_STILL */
+static void sim_apply(uint32_t now) {
+  imuOk = 1; imuFound = 1; imuFailN = 0;
+  pose = simPose;
+  if (pose == LP_TIPPED_STILL && now - lastMoveMs < STILL_MS) pose = LP_TIPPED_MOVING;
+  devDeg  = (simPose == LP_STANDING) ? 0.0f : (simPose == LP_TILTING) ? 10.0f : 41.6f;
+  tiltDeg = devDeg;
+  restDevDeg = 41.6f - devDeg;                   /* simulated: tipped back = fully back */
+}
+#endif
+
 /* rest zero (zero tracking while tipped back and still) */
-#define ZT_HIST 32                               /* rows of history (3.2 s)                 */
+#define ZT_HIST 64                               /* rows of history (6.4 s) [F4]            */
 #define ZT_RUN  25                               /* still rows before tracking (2.5 s)      */
+#define ZT_HOLD_MS 3000U                         /* [F4] within +/-'a' kg this long -> zero */
 #define ZT_LAG  11                               /* newest sample used is 1.1 s old         */
 #define ZT_N    8                                /* samples averaged into the zero          */
 static int32_t  ztHist[2][ZT_HIST]; static uint8_t ztIdx, ztCount;
 static uint16_t ztRun; static uint8_t ztTracking, ztBooted, ztWarned;
 static uint32_t ztRejectSinceMs; static float ztEpisodeKg;
+static uint32_t ztInBandMs;                      /* [F4] start of the current in-band run */
 static float    heldKg;                          /* last valid standing load              */
 
 /* [RT] load-detect console */
@@ -238,9 +276,19 @@ static void out_evt(const char *fmt, ...) {
   uart_print(buf);
 }
 
+/* [F4] clock for whichever port board.h puts a pin on */
+static void gpio_clk(const GPIO_TypeDef *p) {
+  if      (p == GPIOA) __HAL_RCC_GPIOA_CLK_ENABLE();
+  else if (p == GPIOB) __HAL_RCC_GPIOB_CLK_ENABLE();
+  else if (p == GPIOC) __HAL_RCC_GPIOC_CLK_ENABLE();
+  else if (p == GPIOD) __HAL_RCC_GPIOD_CLK_ENABLE();
+  else if (p == GPIOE) __HAL_RCC_GPIOE_CLK_ENABLE();
+}
+
 static void pins_init(void) {
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
+  gpio_clk(LC_CH1_DT_PORT); gpio_clk(LC_CH1_SCK_PORT);
+  gpio_clk(LC_CH2_DT_PORT); gpio_clk(LC_CH2_SCK_PORT);
+  gpio_clk(LC_LED_PORT);
 
   GPIO_InitTypeDef g = {0};
   /* HX711 DT inputs, pulled up so a loose wire reads "not ready" -> NO_DATA */
@@ -248,7 +296,7 @@ static void pins_init(void) {
   g.Pin = LC_CH1_DT_PIN; HAL_GPIO_Init(LC_CH1_DT_PORT, &g);
   g.Pin = LC_CH2_DT_PIN; HAL_GPIO_Init(LC_CH2_DT_PORT, &g);
 
-  /* HX711 SCK outputs (PB3 / PB4 leave JTAG; SWD on PA13 / PA14 still works) */
+  /* HX711 SCK outputs */
   memset(&g, 0, sizeof(g));
   g.Mode = GPIO_MODE_OUTPUT_PP; g.Pull = GPIO_NOPULL; g.Speed = GPIO_SPEED_FREQ_LOW;
   g.Pin = LC_CH1_SCK_PIN; HAL_GPIO_Init(LC_CH1_SCK_PORT, &g);
@@ -256,7 +304,7 @@ static void pins_init(void) {
   HAL_GPIO_WritePin(LC_CH1_SCK_PORT, LC_CH1_SCK_PIN, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(LC_CH2_SCK_PORT, LC_CH2_SCK_PIN, GPIO_PIN_RESET);
 
-  /* LD2 status LED */
+  /* status LED (DISC1 LD4 green, PD12) */
   g.Pin = LC_LED_PIN; HAL_GPIO_Init(LC_LED_PORT, &g);
 
   /* cycle counter for microsecond delays */
@@ -282,7 +330,7 @@ static int32_t hx_read(const chan_t *c) {
       v <<= 1;
       if (c->dtPort->IDR & c->dtPin) v |= 1U;
     }
-    c->skPort->BRR = c->skPin;
+    c->skPort->BSRR = (uint32_t)c->skPin << 16;   /* [F4] no BRR register */
     delay_us(1);
   }
   __enable_irq();
@@ -308,7 +356,14 @@ static int hx_average(chan_t *c, int n, int32_t *result) {
 }
 
 /* ------------------------------------------------------------------ flash store */
-static uint32_t store_addr(void) { return FLASH_BASE + FLASH_SIZE - FLASH_PAGE_SIZE; }
+/* [F4] Settings live in the last flash sector of the F407VG: sector 11,
+ * 0x080E0000-0x080FFFFF (128 KB).  The F4 erases whole sectors, so this
+ * reserves the top 128 KB - keep the firmware image below 896 KB.  An
+ * OpenOCD upload only erases the sectors the image uses, so reflashing
+ * keeps the calibration. */
+#define LC_STORE_ADDR    0x080E0000UL
+#define LC_STORE_SECTOR  FLASH_SECTOR_11
+static uint32_t store_addr(void) { return LC_STORE_ADDR; }
 
 /* [RT] default poses in the RotaTruck cart frame (imu.c, board.h
  * IMU_AXIS_SIGN_*), measured on the truck 2026-11-10 with the ISM330DHCX:
@@ -370,23 +425,27 @@ static int store_load(void) {
   return res;
 }
 
-/* Page erase stalls the CPU ~20 ms; only reached from console commands,
- * where the assist is forced off. */
+/* [F4] Sector erase: 128 KB takes ~1-2 s, and the CPU (running from flash)
+ * stalls for all of it - interrupts included.  Only reached from console
+ * commands, where the assist is forced off.  Word programming needs
+ * VDD 2.7-3.6 V (DISC1: 3.0 V). */
 static int store_save(void) {
   FLASH_EraseInitTypeDef e = {0};
   uint32_t err = 0, addr = store_addr();
   HAL_StatusTypeDef st;
   HAL_FLASH_Unlock();
-  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
-  e.TypeErase = FLASH_TYPEERASE_PAGES;
-  e.Banks = FLASH_BANK_1;
-  e.Page = (FLASH_SIZE / FLASH_PAGE_SIZE) - 1U;
-  e.NbPages = 1;
+  __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR |
+                         FLASH_FLAG_PGAERR | FLASH_FLAG_PGPERR | FLASH_FLAG_PGSERR);
+  e.TypeErase    = FLASH_TYPEERASE_SECTORS;
+  e.Sector       = LC_STORE_SECTOR;
+  e.NbSectors    = 1;
+  e.VoltageRange = FLASH_VOLTAGE_RANGE_3;
   st = HAL_FLASHEx_Erase(&e, &err);
-  for (uint32_t i = 0; st == HAL_OK && i < sizeof(cfg) / 8U; i++) {
-    uint64_t dw;
-    memcpy(&dw, (const uint8_t *)&cfg + 8U * i, 8);
-    st = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr + 8U * i, dw);
+  for (uint32_t i = 0; st == HAL_OK && i < sizeof(cfg); i += 4U) {
+    uint32_t w = 0xFFFFFFFFUL;
+    uint32_t n = sizeof(cfg) - i < 4U ? sizeof(cfg) - i : 4U;
+    memcpy(&w, (const uint8_t *)&cfg + i, n);
+    st = HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + i, w);
   }
   HAL_FLASH_Lock();
   if (st != HAL_OK) out_evt("# ERROR: load-detect flash save failed\r\n");
@@ -407,7 +466,7 @@ static void compute_constants(void) {
   ch[0].factor = 1.0f + POISSON_RATIO;
   ch[1].factor = 2.0f * (1.0f + POISSON_RATIO);
   for (int i = 0; i < 2; i++)
-    ch[i].cpu = ch[i].factor * (GAUGE_FACTOR / 4.0f) * 256.0f * 8.388608f;
+    ch[i].cpu = ch[i].factor * (GAUGE_FACTOR / 4.0f) * (float)HX_GAIN * 16.777216f;   /* 2^24 counts per AVDD/gain */
   ch[0].sign = cfg.sign1; ch[1].sign = cfg.sign2;
   /* CH1: R1 / R3 gauges, R2 / R4 completion */
   float vA = R_GAUGE / (R_GAUGE + R_GAUGE);
@@ -537,12 +596,11 @@ static void print_cal(void) {
   if (AZT_BAND_KG <= 0) {
     out("# zero tracking        = off ('a <kg>' to turn on)\r\n");
   } else if (gating()) {
-    out("# zero tracking        = REST ZERO: tipped back and still, steps up to +/-%.2f kg%s\r\n",
-        (double)AZT_BAND_KG, cfg.calValid[v] ? "" : " (nominal before calibration)");
-  } else if (cfg.calValid[v] && cfg.coff[v] != 0.0f) {
-    out("# zero tracking        = off: this view has an offset. Zero by hand ('t' tipped back, empty)\r\n");
+    out("# zero tracking        = REST ZERO: tipped back and still, within +/-%.2f kg for %.1f s%s\r\n",
+        (double)AZT_BAND_KG, (double)(ZT_HOLD_MS / 1000.0f), cfg.calValid[v] ? "" : " (nominal before calibration)");
   } else if (cfg.calValid[v]) {
-    out("# zero tracking        = auto-zero +/-%.2f kg after %.1f s stable\r\n", (double)AZT_BAND_KG, (double)AZT_TIME_S);
+    out("# zero tracking        = auto-zero (no pose gating): within +/-%.2f kg for %.1f s stable\r\n",
+        (double)AZT_BAND_KG, (double)AZT_TIME_S);
   } else {
     out("# zero tracking        = auto-zero +/-%.2f kg, starts once this view is calibrated\r\n", (double)AZT_BAND_KG);
   }
@@ -550,8 +608,12 @@ static void print_cal(void) {
 
 static void print_imu(void) {
   /* [RT] the host regex expects "ISM330DHCX" or "NOT FOUND" */
+#if LC_POSE_SIM
+  if (simPose) out("# IMU                  = SIMULATED pose (q f s / r / t, q f 0 = real IMU) - loadcell_test only\r\n");
+  else
+#endif
   if (imuOk) out("# IMU                  = ISM330DHCX at 0x%02X (shared IMU layer)\r\n", ism330Addr());
-  else       out("# IMU                  = NOT FOUND (I2C1: SDA PB9 / D14, SCL PB8 / D15)\r\n");
+  else       out("# IMU                  = NOT FOUND (I2C1: SDA PB9, SCL PB8)\r\n");
   if (gating())
     out("# pose gating          = ON (q 1): zero when tipped back + still, read when standing\r\n");
   else
@@ -589,10 +651,10 @@ static void print_commands(void) {
 }
 
 static void print_banner(void) {
-  out("# Strain gauge rig v4.2-rt, NUCLEO-G491RE - %s, HX711 x2 (RotaTruck integrated)\r\n", view_cfg());
-  out("#   CH1 middle       %s  x%.3f  %.1f cts/ustr  DT PA10 (D2)  SCK PB3 (D3)  sign %+ld\r\n",
+  out("# Strain gauge rig v4.2-rt, STM32F407 DISC1 - %s, HX711 x2 (RotaTruck integrated)\r\n", view_cfg());
+  out("#   CH1 middle       %s  x%.3f  %.1f cts/ustr  DT PE11  SCK PE12 sign %+ld\r\n",
       ch[0].cfg, (double)ch[0].factor, (double)ch[0].cpu, (long)ch[0].sign);
-  out("#   CH2 left+right   %s  x%.3f  %.1f cts/ustr  DT PB5 (D4)   SCK PB4 (D5)  sign %+ld\r\n",
+  out("#   CH2 left+right   %s  x%.3f  %.1f cts/ustr  DT PE13  SCK PE14 sign %+ld\r\n",
       ch[1].cfg, (double)ch[1].factor, (double)ch[1].cpu, (long)ch[1].sign);
   out("# gauge / comp        = %.0f / %.0f ohm\r\n", (double)R_GAUGE, (double)cfg.compTop);
   print_comp();
@@ -919,6 +981,7 @@ static void pose_refs(void) {
   }
   memcpy(refS, s, sizeof(refS));
   memcpy(refRp, p, sizeof(refRp));
+  memcpy(refR, r, sizeof(refR));
   /* tipped back = past TIP_DEG, or past 60 % of a captured rest angle if that is shallower */
   tipLimDeg = TIP_DEG;
   if (cfg.imuRef & 2U) {
@@ -938,6 +1001,9 @@ static void imu_service(void) {
   if (now - imuLastMs < IMU_PERIOD_MS) return;
   float dt = (float)(imuLastMs ? (now - imuLastMs) : IMU_PERIOD_MS) / 1000.0f;
   imuLastMs = now;
+#if LC_POSE_SIM
+  if (simPose) { sim_apply(now); return; }
+#endif
 
   float a[3], g[3]; uint32_t t = 0;
   int fresh = imuGetLatest(a, g, &t) && (now - t) <= IMU_STALE_MS;
@@ -974,6 +1040,10 @@ static void imu_service(void) {
   if (cs < -1.0f) cs = -1.0f;
   tiltDeg = atan2f(dot3(u, refRp), cs) * 57.29578f;
   devDeg  = acosf(cs) * 57.29578f;
+  float cr = dot3(u, refR);                      /* [F4] how far from FULLY tipped back */
+  if (cr > 1.0f) cr = 1.0f;
+  if (cr < -1.0f) cr = -1.0f;
+  restDevDeg = acosf(cr) * 57.29578f;
   int still = (now - lastMoveMs) >= STILL_MS;
   float standLim = (pose == LP_STANDING) ? STAND_DEG + 1.0f : STAND_DEG;   /* 1 deg hysteresis */
   if (devDeg <= standLim)        pose = LP_STANDING;
@@ -986,6 +1056,28 @@ static void imu_command(char *args) {
   while (*args == ' ') args++;
   char c = *args;
   if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+#if LC_POSE_SIM
+  if (c == 'f') {
+    const char *q = args + 1;
+    while (*q == ' ') q++;
+    char m = *q;
+    if (m >= 'A' && m <= 'Z') m = (char)(m + 32);
+    uint8_t want = (m == 's') ? LP_STANDING : (m == 'r' || m == 'b') ? LP_TIPPED_STILL :
+                   (m == 't') ? LP_TILTING : (m == '0') ? 0 : 255;
+    if (want == 255) { out("# usage: q f s (standing) | q f r (tipped back) | q f t (tilting) | q f 0 (real IMU)\r\n"); return; }
+    if (want != simPose) {
+      simPose = want;
+      lastMoveMs = millis(); movedSinceRow = 1;  /* a pose change = someone moved it: 1 s to settle */
+      if (!want) { imuOk = 0; imuFailN = 0; aInit = 0; pose = LP_UNKNOWN; }
+    }
+    if (want) sim_apply(millis());
+    if (want) out("# SIMULATED pose: %s (bench test, no IMU - loadcell_test only)\r\n", POSE_NAME[want]);
+    else      out("# pose simulator off - using the real IMU\r\n");
+    if (want && !gating()) out("# [WARN] pose gating is OFF (q 0): send 'q 1' so the simulated pose is used\r\n");
+    print_imu();
+    return;
+  }
+#endif
   if (c == '0' || c == '1') {
     cfg.poseMode = (c == '1') ? 1U : 0U; store_save();
     ztRun = 0; ztTracking = 0; aztSinceMs = 0; lastPrintedStatus = 255;
@@ -1036,13 +1128,15 @@ static void rest_zero_row(void) {
   if (ztCount < ZT_HIST) ztCount++;
   int rowStill = gating() && imuOk && pose == LP_TIPPED_STILL && !movedSinceRow;
   movedSinceRow = 0;
-  if (!rowStill) { ztRun = 0; rest_zero_end(); return; }
+  if (!rowStill) { ztRun = 0; ztInBandMs = 0; rest_zero_end(); return; }
   if (ztRun < 0xFFFFU) ztRun++;
-  if (AZT_BAND_KG <= 0 || repActive || ztRun < ZT_RUN || ztCount < ZT_LAG + ZT_N) return;
+  if (AZT_BAND_KG <= 0 || repActive || ztCount < ZT_LAG + ZT_N) return;
 
   /* every sample in the window must be inside the band, not just their average,
-   * otherwise a sudden contact could creep in one eighth at a time */
-  float band = ztBooted ? AZT_BAND_KG : 5.0f * AZT_BAND_KG;     /* first one after power-up */
+   * otherwise a sudden contact could creep in one eighth at a time.
+   * [F4] same +/-'a' kg band at all times (was 5x for the first one after
+   * power-up); a bigger offset needs a manual zero ('t' / handle triple click). */
+  float band = AZT_BAND_KG;
   int64_t sum[2] = { 0, 0 };
   float worst = 0.0f;
   for (int k = 0; k < ZT_N; k++) {
@@ -1055,6 +1149,7 @@ static void rest_zero_row(void) {
   float dkg = step_kg(combine(tared(&ch[0], cand[0]), tared(&ch[1], cand[1])));
   if (fabsf(worst) > band) {
     dkg = worst;
+    ztInBandMs = 0;
     uint32_t now = millis();
     if (!ztRejectSinceMs) ztRejectSinceMs = now ? now : 1U;
     else if (!ztWarned && now - ztRejectSinceMs > 30000U) {
@@ -1065,7 +1160,14 @@ static void rest_zero_row(void) {
     return;
   }
   ztRejectSinceMs = 0; ztWarned = 0;
-  if (!ztTracking) { ztTracking = 1; ztEpisodeKg = 0; out("# rest zero: tipped back and still, tracking the zero\r\n"); }
+  /* [F4] zero only after the reading has hovered within the band for ZT_HOLD_MS (3 s) */
+  if (!ztTracking) {
+    uint32_t now = millis();
+    if (!ztInBandMs) { ztInBandMs = now ? now : 1U; return; }
+    if ((uint32_t)(now - ztInBandMs) < ZT_HOLD_MS) return;
+  }
+  if (!ztTracking) { ztTracking = 1; ztEpisodeKg = 0; out_evt("# LOAD: rest zero - within +/-%.1f kg for %.0f s, tipped back and still: zeroing (%+.2f kg)\r\n",
+                                                             (double)AZT_BAND_KG, (double)(ZT_HOLD_MS / 1000.0f), (double)dkg); }
   for (int i = 0; i < 2; i++) if (in_view(i)) ch[i].tare = cand[i];
   ztEpisodeKg += dkg; ztBooted = 1;
   heldKg = 0;                                    /* tipped back and matching the empty zero */
@@ -1274,7 +1376,10 @@ void loadcellInit(void) {
 
   /* each bridge: saved zero if it has one, otherwise a quick tare now */
   int32_t keep[2] = { cfg.zero1, cfg.zero2 };
-  int present[2] = { hx_wait(&ch[0], 250), hx_wait(&ch[1], 250) };
+  /* [F4] 600 ms: after an MCU reset the SCK pin floats until pins_init(), which
+   * can power the HX711 down; its first conversion after waking takes ~400 ms
+   * at 10 SPS, so 250 ms reported a working channel as MISSING. */
+  int present[2] = { hx_wait(&ch[0], HX_WAKE_MS), hx_wait(&ch[1], HX_WAKE_MS) };
   if ((!zero_ok(0) && present[0]) || (!zero_ok(1) && present[1])) do_tare_n(0, BOOT_TARE_N);
   for (int i = 0; i < 2; i++) if (zero_ok(i)) ch[i].tare = keep[i];
   ztBooted = 0;                                  /* the power-up zero is not operator-confirmed */
@@ -1314,7 +1419,7 @@ void loadcellUpdate(void) {
 
   float view = combine(tared(&ch[0], ch[0].med), tared(&ch[1], ch[1].med));
   float offset = FILTER_MODE ? hold_stage(view) : low_pass_stage(view);
-  if (!gating() && cfg.coff[cfg.view] == 0.0f) auto_zero(&offset);   /* standing auto-zero, old rig */
+  if (!gating()) auto_zero(&offset);   /* no-IMU auto-zero: +/-'a' kg for AZT_TIME_S (3 s) [F4: also with an offset] */
 
   float ustrain = offset / ref_cpu();
   float newtons = view_newtons(offset);
@@ -1355,3 +1460,46 @@ bool  loadcellValid(void)                { return payload_valid() != 0; }
 float loadcellAssistKg(void)             { return assistKg; }
 float loadcellMeasuredKg(void)           { return measuredKg; }
 
+/* [F4] pose as seen by load detection (IMU gravity vs the captured references) */
+bool  loadcellImuOk(void)          { return imuOk != 0; }
+bool  loadcellPoseStanding(void)   { return imuOk && pose == LP_STANDING; }
+bool  loadcellPoseTipped(void)     { return imuOk && (pose == LP_TIPPED_STILL || pose == LP_TIPPED_MOVING); }
+float loadcellStandDevDeg(void)    { return imuOk ? devDeg : 0.0f; }
+float loadcellRestDevDeg(void)     { return imuOk ? restDevDeg : 180.0f; }
+const char *loadcellPoseName(void) { return imuOk ? POSE_NAME[pose] : "NO IMU"; }
+
+/* [F4] Manual zero from the handle switch (triple click): only at / near the
+ * tipped-back pose (where the empty zero is defined).  Non-blocking and RAM
+ * only (a flash save stalls the CPU ~1-2 s - not with the motors live): the
+ * zero is the average of samples taken BEFORE the first click, so the clicks
+ * shaking the plate don't get into it.  No band limit - the operator says
+ * the plate is empty.  Returns false (with the reason printed) if refused. */
+bool loadcellZeroFromHandle(uint32_t first_press_ms)
+{
+  if (!imuOk) {
+    out_evt("# LOAD: handle zero refused - no IMU, can't confirm the trolley is tipped back\r\n");
+    return false;
+  }
+  if (pose != LP_TIPPED_STILL && pose != LP_TIPPED_MOVING) {
+    out_evt("# LOAD: handle zero refused - not tipped back (pose %s, %.1f deg from standing). "
+            "Rest it tipped back, plate empty, then triple-click.\r\n", POSE_NAME[pose], (double)devDeg);
+    return false;
+  }
+  uint32_t back = (uint32_t)(millis() - first_press_ms) / 100U + 2U;   /* rows since the 1st click */
+  if (ztCount < back + ZT_N || back + ZT_N > ZT_HIST) {
+    out_evt("# LOAD: handle zero refused - not enough history before the clicks yet\r\n");
+    return false;
+  }
+  int64_t sum[2] = { 0, 0 };
+  for (uint32_t k = 0; k < ZT_N; k++) {
+    int j = (int)((ztIdx + 2U * ZT_HIST - 1U - back - k) % ZT_HIST);
+    sum[0] += ztHist[0][j]; sum[1] += ztHist[1][j];
+  }
+  int32_t cand[2] = { (int32_t)(sum[0] / ZT_N), (int32_t)(sum[1] / ZT_N) };
+  float dkg = step_kg(combine(tared(&ch[0], cand[0]), tared(&ch[1], cand[1])));
+  for (int i = 0; i < 2; i++) if (in_view(i)) ch[i].tare = cand[i];
+  heldKg = 0; ztInBandMs = 0; aztSinceMs = 0;
+  out_evt("# LOAD: ZEROED by handle triple-click (tipped back): moved %+.2f kg (RAM; 'z' saves to flash)\r\n",
+          (double)dkg);
+  return true;
+}

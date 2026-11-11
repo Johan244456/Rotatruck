@@ -26,8 +26,9 @@
 #include "admittance.h"
 #include "observer.h"
 #include "deadman.h"
+#include "loadcell.h"
 #include "command.h"
-#include "stm32g4xx_hal.h"
+#include "stm32f4xx_hal.h"
 
 #include <math.h>
 
@@ -152,6 +153,43 @@ static void set_motor_mode(motor_mode_t m)
 }
 
 /* =====================================================================
+ *  Handle switch arms / disarms the assist (board.h DEADMAN_ARMS_ASSIST)
+ * =====================================================================*/
+#if DEADMAN_ARMS_ASSIST
+static bool     s_dm_last      = true;     /* must be seen RELEASED before a press can arm */
+static uint32_t s_dm_stopped_t = 0;          /* 0 = not yet stopped since release */
+
+/* Press edge -> arm (with friction / gravity comp, as the B1 / D8 button).
+ * Release -> the normal stop ramp runs below; once the wheels are at 0 (or
+ * were held / idle) for DEADMAN_DISARM_HOLD_MS, disarm: axes IDLE. */
+static void deadman_arm_logic(uint32_t now)
+{
+    const bool pressed = deadmanPressed();
+    const bool held    = deadmanHeld();          /* >= DEADMAN_HOLD_MS: quick clicks never arm */
+    if (held && !s_dm_last) {
+        s_dm_stopped_t = 0;
+        if (!admittanceIsEnabled()) {
+            uart_print("SAFETY: handle pressed - arming the assist.\r\n");
+            admittanceToggleWithComp();          /* refused (and says why) if no ODrive */
+        }
+    }
+    s_dm_last = held;
+
+    if (pressed || !admittanceIsEnabled()) { s_dm_stopped_t = 0; return; }
+    const bool stopped = (motor_mode == MM_STOP_RAMP && s_ramp_done) ||
+                         motor_mode == MM_BRAKE || motor_mode == MM_IDLE;
+    if (!stopped) { s_dm_stopped_t = 0; return; }
+    if (s_dm_stopped_t == 0) { s_dm_stopped_t = now ? now : 1U; return; }
+    if ((uint32_t)(now - s_dm_stopped_t) >= DEADMAN_DISARM_HOLD_MS) {
+        uart_print("SAFETY: handle released and stopped - disarming the assist.\r\n");
+        admittanceToggleWithComp();              /* -> disabled, comp off, axes IDLE */
+        motor_mode     = MM_IDLE;
+        s_dm_stopped_t = 0;
+    }
+}
+#endif
+
+/* =====================================================================
  *  Public API
  * =====================================================================*/
 void assistSetup(void)
@@ -170,6 +208,12 @@ void assistSetup(void)
     } else {
         uart_print("Pose: no IMU - detection disabled (dev mode).\r\n");
     }
+#if DEADMAN_ARMS_ASSIST
+    s_dm_last = true;                     /* held at power-up: no arming until released + pressed again */
+    s_dm_stopped_t = 0;
+    uart_print("SAFETY: handle switch arms the assist (DEADMAN_ARMS_ASSIST) - hold = ON, "
+               "release = ramp to stop, then OFF.  Triple-click tipped back = zero the load.\r\n");
+#endif
 }
 
 void assistUpdate(void)
@@ -177,6 +221,9 @@ void assistUpdate(void)
     uint32_t now = HAL_GetTick();
     if ((uint32_t)(now - last_tick_ms) < ASSIST_TICK_MS) return;
     last_tick_ms = now;
+#if DEADMAN_ARMS_ASSIST
+    deadman_arm_logic(now);
+#endif
 
     if (!imu_present_at_boot && imuIsPresent()) {
         /* The IMU came up after boot (imu.c retries its setup): leave dev
@@ -199,6 +246,19 @@ void assistUpdate(void)
     float pitch = current_pitch_deg();
 
     TruckPose detected;
+#if POSE_FROM_LOAD_REFS
+    /* Same captured references as load detection (board.h POSE_FROM_LOAD_REFS). */
+    /* DRIVE (assist) only when tipped back FULLY; everything else holds the
+     * wheels: upright, partly tilted, IMU lost.  Hysteresis: enter within
+     * POSE_DRIVE_FULL_ENTER_DEG of `q r`, leave beyond POSE_DRIVE_FULL_EXIT_DEG. */
+    (void)pitch;
+    if (!loadcellImuOk()) {
+        detected = POSE_STANDING;                                /* IMU lost: hold the wheels */
+    } else {
+        const float lim = (pose == POSE_DRIVE) ? POSE_DRIVE_FULL_EXIT_DEG : POSE_DRIVE_FULL_ENTER_DEG;
+        detected = (loadcellRestDevDeg() <= lim) ? POSE_DRIVE : POSE_STANDING;
+    }
+#else
     if (pitch > POSE_DRIVE_ENTER_DEG) {           /* higher pitch -> DRIVING  */
         detected = POSE_DRIVE;
     } else if (pitch < POSE_STANDING_ENTER_DEG) { /* lower pitch  -> STANDING */
@@ -206,6 +266,7 @@ void assistUpdate(void)
     } else {
         detected = pose;                  /* hysteresis band -> hold */
     }
+#endif
 
     if (detected != pose) {
         if (detected != pose_candidate) {

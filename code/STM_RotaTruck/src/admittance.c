@@ -29,7 +29,7 @@
 #include "assist_control.h"   /* assistDriveActive() — pose gate */
 #include "loadcell.h"         /* refuse assist while the LD console is open */
 #include "command.h"
-#include "stm32g4xx_hal.h"
+#include "stm32f4xx_hal.h"
 
 #include <math.h>
 

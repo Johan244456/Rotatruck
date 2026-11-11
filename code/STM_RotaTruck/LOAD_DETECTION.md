@@ -17,20 +17,36 @@ Automatic payload detection (spec FR5) from the P102 bench rig (`Code_STM/P102_L
 
 The bench rig's signal chain, filters, gauge views, rest zero, status codes, flash settings layout (v6) and command letters are unchanged.
 
-## Wiring
+## Wiring (STM32F407G-DISC1)
 
-| Signal | Nucleo pin | Header |
+| Signal | DISC1 pin |
+|---|---|
+| HX711 #1 (CH1, middle strip) DT | PE11 |
+| HX711 #1 SCK | PE12 |
+| HX711 #2 (CH2, left + right strips) DT | PE13 |
+| HX711 #2 SCK | PE14 |
+| Both HX711 VCC | **3V** (the DISC1 rail is 3.0 V; not 5V) |
+| Both HX711 GND | GND |
+| Status LED | green LD4 / PD12 (on the board) |
+| IMU ISM330DHCX (3V only) | PB9 SDA / PB8 SCL, shared with the LCD |
+
+Both HX711s are on the PE header (PE11-PE14) rather than the Nucleo's PA10/PB3 and PB5/PB4 (PA10 is the DISC1's micro-USB ID line, PB3 the ST-Link SWO line). The bridge wiring is the same as on the bench rig.
+
+The Nucleo-G491RE pins (D2-D5, LD2/PA5) are in git history (commit eb04ba3). The payload buttons and assist button still use the Nucleo pins in `board.h` and still need moving for the DISC1.
+
+## Operator workflow (F407, handle switch)
+
+One pose definition drives everything (board.h `POSE_FROM_LOAD_REFS`): the captured standing (`q s`) and tipped-back (`q r`) poses decide where the load is accepted **and** what the motors do. Upright = wheels held; tipped back = assist drives; IMU lost = wheels held.
+
+| Handle | When | Result |
 |---|---|---|
-| HX711 #1 (CH1, middle strip) DT | D2 / PA10 | CN9 pin 3 |
-| HX711 #1 SCK | D3 / PB3 | CN9 pin 4 |
-| HX711 #2 (CH2, left + right strips) DT | D4 / PB5 | CN9 pin 5 |
-| HX711 #2 SCK | D5 / PB4 | CN9 pin 6 |
-| Both HX711 VCC | **3V3** (not 5V) | CN6 pin 4 |
-| Both HX711 GND | GND | CN6 pin 6 |
-| Status LED | LD2 / PA5 (on the board) | |
-| IMU ISM330DHCX (3V3 only) | D14 SDA / D15 SCL, shared with the LCD | |
+| **1 click** | trolley **exactly upright** (within 2 deg of `q s`), hands off the load ~1 s first | the most recent settled reading is **accepted and frozen** as the load; the assist is set for **0.7 x** that load (`LOAD_ASSIST_SCALE`) |
+| **3 quick clicks** | **tipped back**, plate empty | scale **zeroed** (RAM; `LD`, `z`, `LD` saves it) |
+| **hold** (>= 0.4 s) | any time | **assist on**; upright = wheels held, tip back = assist drives; **release = ramp to a stop, then off** |
 
-The bridge wiring is the same as on the bench rig. The payload buttons (PB6 / D10 = +5 kg, PC7 / D9 = -5 kg), the D8 assist button and the B1 button are unchanged.
+The load the assist uses is 15 kg at power-up (`PAYLOAD_DEFAULT_KG`, assist 10.5 kg) until a load is accepted, or `W <kg>` sets one. While resting tipped back, the scale re-zeroes itself if it stays within +/-3 kg of zero for 3 s.
+
+Live view for anyone running a test: `tools/rtt_server.sh --attach` in one terminal, `python3 host/live_load_log.py` in another (plain language; `--tech` for every value). Data is logged to `data/strain_gauge/live_load_*.csv`.
 
 ## How the payload reaches the assist
 
@@ -59,7 +75,7 @@ The bridge wiring is the same as on the bench rig. The payload buttons (PB6 / D1
 | A +/- button pressed (or `W <kg>`) | Manual, starting from the value in use, so a press nudges a latched value by 5 kg |
 | Next armed STANDING -> DRIVE | Load detection latches again |
 
-The manual value starts at 0 kg at power-up and is not saved. The payload sets the observer's mass and friction model, and is only pushed when it changes.
+The manual value starts at `PAYLOAD_DEFAULT_KG` (board.h, 15 kg for the DISC1 bring-up; originally 0) at power-up and is not saved. The payload sets the observer's mass and friction model, and is only pushed when it changes.
 
 Status codes (CSV and `W`): 0 OK, 1 SETTLING, 2 NO_CAL, 3 RAILED, 4 FROZEN, 5 NO_DATA, 6 IMPLAUSIBLE, 7 OVERLOAD, 8 HELD, 9 IMU_FAULT.
 
@@ -85,13 +101,22 @@ The motor console (115200, ST-LINK COM port) gains:
 
 ## Host GUIs
 
-Copies of the bench-rig GUIs are in `host/`. They now send `LD 1` on connect and `LD 0` on close. Run them the same way as before, with the PlatformIO serial monitor closed:
+Copies of the bench-rig GUIs are in `host/`. They now send `LD 1` on connect and `LD 0` on close.
+
+On the DISC1 the ST-Link's USB COM port is not wired to the F407, so the GUIs talk over RTT through the debugger instead, on `socket://localhost:9090` (listed first in the GUIs' port box). One-time setup on Linux: `sudo apt install python3-serial`.
+
+1. Upload the firmware (`pio run -e loadcell_test -t upload` for bench testing) and close the PlatformIO serial monitor.
+2. Terminal 1, leave it running: `tools/rtt_server.sh`
+3. Terminal 2:
 
 ```
 cd host
-py -3.13 stm_dashboard.py      # calibration dashboard
-py -3.13 stm_dual_test.py      # drift / stability test
+python3 stm_dashboard.py      # calibration dashboard
+python3 stm_dual_test.py      # drift / stability test
+python3 stm_dashboard.py socket://localhost:9090 test_01   # straight in
 ```
+
+4. Close the GUI, then Ctrl-C in terminal 1 (frees the ST-Link for uploads).
 
 Data is written to `data/strain_gauge/` in this project. The earlier bench data stays in `Code_STM/P102_LoadDetect_Main/data/`.
 
@@ -125,7 +150,7 @@ Rules:
 ## Bring-up on the truck (to do)
 
 1. Wire the HX711s (table above). Measure 3V3 to GND for a short before powering up.
-2. Flash the firmware. The boot log should show `LOAD: HX711 CH1 ok, CH2 ok | ...`. On a fresh board it also shows `view not calibrated -> assist payload 0 kg (NO_CAL)`.
+2. Flash the firmware (`loadcell_test` for bench work: load detection + IMU only, LD console on from boot, no CAN or motors). The boot log should show `LOAD: HX711 CH1 ok, CH2 ok | ...`. On a fresh board it also shows `view not calibrated -> assist payload 0 kg (NO_CAL)`.
 3. `LD`, then `b` and `d`: check that both channels respond.
 4. Capture the IMU poses for the load plate: standing with at least 15 kg on and hands off, `q s`; tipped back and empty, `q r`. The defaults were measured on the truck (standing about -43.6 deg, tipped back about -1.2 deg pitch), but capturing them is more accurate.
 5. Calibrate with `host/stm_dashboard.py`: save zero (tipped back, empty), check signs, then follow the **Calibration routine** above for 2 SG and 4 SG, balance g, and finally All 6 (the view the assist uses).
@@ -143,11 +168,10 @@ Rules:
 
 ## Known limits
 
-- **Not run on hardware yet.** Expect first-run issues around HX711 timing at 170 MHz (it uses the DWT cycle counter, so it should be unchanged) and the flash page save.
+- **Not run on the F407 yet.** HX711 timing uses the DWT cycle counter, so it should carry over at 168 MHz. Settings are saved in flash sector 11 (0x080E0000): a save stalls the CPU for about 1-2 s (it was about 20 ms on the G4's 2 KB page). It only happens from console commands, while the assist is off.
 - There is no backup IMU. If the ISM330DHCX fails, the status goes to IMU_FAULT and the payload drops to 0 kg. The pose machine also loses its pitch reading.
 - The LCD backpack shares the I2C bus. If its SDA / SCL pull-ups go to 5 V, they over-drive the 3.3 V-only ISM330DHCX. Measure SDA and SCL to GND with power on: they should read about 3.3 V.
 - Front-to-back load placement error and toe friction (bench-rig `CONTEXT.md`) are unchanged.
-- Saving to flash stalls the CPU for about 20 ms. It only happens from console commands, while the assist is off.
 
 ## Files
 

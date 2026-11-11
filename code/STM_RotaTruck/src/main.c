@@ -17,7 +17,7 @@
  *  Debug  : USART2 via the ST-Link VCP, 115200 8N1.
  */
 
-#include "stm32g4xx_hal.h"
+#include "stm32f4xx_hal.h"
 #include "board.h"
 #include "motor_control.h"
 #include "command.h"
@@ -33,7 +33,7 @@
 #include "payload.h"
 #include "deadman.h"
 
-static void SystemClock_Config(void);
+void SystemClock_Config(void);   /* clock_f4.c: 168 MHz, APB1 42 MHz (CAN timing) */
 static void GPIO_Clocks_Enable(void);
 
 int main(void)
@@ -57,14 +57,15 @@ int main(void)
     if (imuBegin()) {
         uart_printf("IMU: using %s for pose + observer.\r\n", imuGetSourceName());
     } else {
-        uart_print("IMU: none detected (check D14/SDA, D15/SCL, 3V3, GND).\r\n");
+        uart_print(IMU_ENABLE ? "IMU: none detected (check PB9/SDA, PB8/SCL, 3V, GND).\r\n"
+                              : "IMU: DISABLED in board.h (IMU_ENABLE 0) - no pose control, handle switch only.\r\n");
     }
     imuScanBus();           /* list everything on I2C1 (IMU swap bring-up) */
 
     /* Status LCD — non-blocking, serviced from the main loop. */
     uart_print(displayInit()
                ? "LCD: 16x2 I2C display detected.\r\n"
-               : "LCD: not detected (check I2C address/wiring on D14/D15).\r\n");
+               : "LCD: not detected (check I2C address/wiring on PB9/PB8).\r\n");
 
     /* Handle (dead-man) safety switch on PE7 - before the pose machine, which
      * ramps the wheels to a stop whenever it reads released. */
@@ -82,7 +83,7 @@ int main(void)
     /* Power-assist torque loop — opt-in, disabled until `AS 1`. */
     admittanceInit();
     autoseqInit();          /* autonomous arm-and-calibrate (R A / R M)    */
-    buttonSetup();          /* B1 USER button (PC13) toggles assist on/off  */
+    buttonSetup();          /* DISC1 blue USER button (PA0) toggles assist on/off */
 
     /* Front-panel buttons: payload +/- (manual fallback) and D8 assist toggle. */
     modeInputSetup();
@@ -117,44 +118,11 @@ static void GPIO_Clocks_Enable(void)
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+    __HAL_RCC_GPIOE_CLK_ENABLE();
 }
 
-/* =====================================================================
- *  170 MHz from HSI16 via PLL, boost mode on.
- *  HSI16/4 -> PLLN 85 -> /2. Unchanged from the earlier BLD300B build.
- * =====================================================================*/
-static void SystemClock_Config(void)
-{
-    HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
 
-    RCC_OscInitTypeDef o = {0};
-    o.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
-    o.HSIState            = RCC_HSI_ON;
-    o.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-    o.PLL.PLLState        = RCC_PLL_ON;
-    o.PLL.PLLSource       = RCC_PLLSOURCE_HSI;
-    o.PLL.PLLM            = RCC_PLLM_DIV4;
-    o.PLL.PLLN            = 85;
-    o.PLL.PLLP            = RCC_PLLP_DIV2;
-    o.PLL.PLLQ            = RCC_PLLQ_DIV2;
-    o.PLL.PLLR            = RCC_PLLR_DIV2;
-    HAL_RCC_OscConfig(&o);
-
-    RCC_ClkInitTypeDef c = {0};
-    c.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
-                     | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-    c.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
-    c.AHBCLKDivider  = RCC_SYSCLK_DIV1;
-    c.APB1CLKDivider = RCC_HCLK_DIV1;
-    c.APB2CLKDivider = RCC_HCLK_DIV1;
-    HAL_RCC_ClockConfig(&c, FLASH_LATENCY_4);
-}
-
-void HAL_MspInit(void)
-{
-    __HAL_RCC_SYSCFG_CLK_ENABLE();
-    __HAL_RCC_PWR_CLK_ENABLE();
-}
 
 /* Unrecoverable fault: kills interrupts and spins forever. No LED/UART
  * output - if the board seems dead at boot, suspect this. */

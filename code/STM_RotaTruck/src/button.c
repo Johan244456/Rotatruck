@@ -15,11 +15,13 @@
 
 #include "button.h"
 #include "admittance.h"
-#include "stm32g4xx_hal.h"
+#include "stm32f4xx_hal.h"
 
-#define USER_BTN_PORT     GPIOC
-#define USER_BTN_PIN      GPIO_PIN_13
-#define USER_BTN_PULL     GPIO_PULLDOWN     /* matches the G491RE BSP */
+/* F407 DISC1: blue USER button B1 on PA0, active-high (pressed = VDD), with
+ * its own pull-down + RC on the board (was PC13 on the Nucleo). */
+#define USER_BTN_PORT     GPIOA
+#define USER_BTN_PIN      GPIO_PIN_0
+#define USER_BTN_PULL     GPIO_NOPULL       /* board has R + C on PA0 */
 #define USER_BTN_PRESSED  GPIO_PIN_SET      /* active-high (pressed = VDD) */
 #define BTN_DEBOUNCE_MS   40U
 
@@ -29,7 +31,7 @@ static uint32_t      s_changed_ms  = 0;
 
 void buttonSetup(void)
 {
-    /* GPIOC clock is already enabled in main's GPIO_Clocks_Enable(). */
+    /* GPIOA clock is already enabled in main's GPIO_Clocks_Enable(). */
     GPIO_InitTypeDef g = {0};
     g.Pin  = USER_BTN_PIN;
     g.Mode = GPIO_MODE_INPUT;

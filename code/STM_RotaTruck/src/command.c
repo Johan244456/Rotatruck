@@ -20,7 +20,8 @@
 #include "loadcell.h"
 #include "payload.h"
 #include "deadman.h"
-#include "stm32g4xx_hal.h"
+#include "rtt.h"
+#include "stm32f4xx_hal.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -43,20 +44,26 @@ static volatile uint8_t  line_ready = 0;
 /* =====================================================================
  *  TX helpers (blocking)
  * =====================================================================*/
+/* F407 DISC1: the ST-Link VCP is not wired to the MCU, so the console is
+ * SEGGER RTT over the ST-Link (PlatformIO serial monitor, socket :9090) -
+ * and also USART2 TX = PA2 for a USB-serial adapter. */
 void uart_print(const char *s)
 {
-    HAL_UART_Transmit(&huart_dbg, (uint8_t *)s, (uint16_t)strlen(s), HAL_MAX_DELAY);
+    size_t n = strlen(s);
+    rttWrite(s, n);
+    HAL_UART_Transmit(&huart_dbg, (uint8_t *)s, (uint16_t)n, HAL_MAX_DELAY);
 }
 
 void uart_printf(const char *fmt, ...)
 {
-    char buf[160];
+    char buf[256];
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     if (n > 0) {
-        if (n > (int)sizeof buf) n = (int)sizeof buf;
+        if (n >= (int)sizeof buf) n = (int)sizeof buf - 1;
+        rttWrite(buf, (size_t)n);
         HAL_UART_Transmit(&huart_dbg, (uint8_t *)buf, (uint16_t)n, HAL_MAX_DELAY);
     }
 }
@@ -92,6 +99,25 @@ static uint32_t ms_stream_last = 0;
 static bool     is_stream_on   = false;
 static uint32_t is_stream_last = 0;
 
+/* Load / payload live log (PL 1 / PL 0 / PL S, 5 Hz; host/live_load_log.py).
+ * PL,t_ms,handle,pitch_deg,lc_pose,stand_dev_deg,rest_dev_deg,load_status,measured_kg,
+ *    offer_kg,load_kg,payload_kg,payload_src,assist_on,assist_pose
+ *    (load_kg = initialised load, payload_kg = LOAD_ASSIST_SCALE x load_kg) */
+static bool     pl_stream_on   = false;
+static uint32_t pl_stream_last = 0;
+
+static void print_payload_log(void)
+{
+    uart_printf("PL,%lu,%d,%.1f,%s,%.1f,%.1f,%s,%.2f,%.2f,%.2f,%.2f,%s,%d,%s\r\n",
+                (unsigned long)HAL_GetTick(), deadmanPressed() ? 1 : 0,
+                (double)assistGetPitchDeg(), loadcellPoseName(), (double)loadcellStandDevDeg(),
+                (double)loadcellRestDevDeg(),
+                loadcellStatusName(), (double)loadcellMeasuredKg(), (double)loadcellAssistKg(),
+                (double)payloadGetLoadKg(), (double)payloadGetKg(),
+                payloadIsManual() ? "MANUAL" : "ACCEPTED",
+                admittanceIsEnabled() ? 1 : 0, assistGetPoseName());
+}
+
 void commandSetup(void)
 {
     huart_dbg.Instance        = DEBUG_UART_INSTANCE;
@@ -102,9 +128,7 @@ void commandSetup(void)
     huart_dbg.Init.Mode       = UART_MODE_TX_RX;
     huart_dbg.Init.HwFlowCtl  = UART_HWCONTROL_NONE;
     huart_dbg.Init.OverSampling     = UART_OVERSAMPLING_16;
-    huart_dbg.Init.OneBitSampling   = UART_ONE_BIT_SAMPLE_DISABLE;
-    huart_dbg.Init.ClockPrescaler   = UART_PRESCALER_DIV1;
-    huart_dbg.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+    rttInit();                 /* console over the ST-Link (RTT) */
     HAL_UART_Init(&huart_dbg);
 
     HAL_UART_Receive_IT(&huart_dbg, (uint8_t *)&rx_byte, 1);
@@ -120,10 +144,9 @@ void commandUartISR(void)
     HAL_UART_IRQHandler(&huart_dbg);
 }
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+/* One received character -> line buffer (USART2 ISR and RTT poll). */
+static void rx_char(char c)
 {
-    if (huart->Instance != DEBUG_UART_INSTANCE) return;
-    char c = rx_byte;
     if (c == '\r' || c == '\n') {
         if (rx_idx > 0) {
             rx_line[rx_idx] = '\0';
@@ -131,9 +154,15 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         }
     } else if ((unsigned char)c < 32 || (unsigned char)c > 126) {
         /* ignore junk bytes (some USB-serial ports send one on open) */
-    } else if (rx_idx < RX_LINE_MAX - 1) {
+    } else if (rx_idx < RX_LINE_MAX - 1 && !line_ready) {
         rx_line[rx_idx++] = c;
     }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance != DEBUG_UART_INSTANCE) return;
+    rx_char(rx_byte);
     HAL_UART_Receive_IT(huart, (uint8_t *)&rx_byte, 1);
 }
 
@@ -224,7 +253,7 @@ static void exec_ld(void)
     }
     if (on) {
         if (admittanceIsEnabled()) admittanceEnable(false);
-        ob_stream_on = as_stream_on = ms_stream_on = is_stream_on = false;
+        ob_stream_on = as_stream_on = ms_stream_on = is_stream_on = pl_stream_on = false;
     }
     loadcellSetConsole(on);
     if (!on) uart_print("OK: motor console. Load detection keeps running (W shows the payload).\r\n");
@@ -266,6 +295,7 @@ static void execute_line(const char *line)
             }
             if (c0 == 'O' && c1 == 'B') { print_observer(); return; }
             if (c0 == 'A' && c1 == 'S') { print_assist_status(); return; }
+            if (c0 == 'P' && c1 == 'L') { print_payload_log(); return; }
         }
         if (strlen(tokv[0]) == 3 && up(tokv[0][0]) == 'I' &&
             tokv[0][1] == '2' && up(tokv[0][2]) == 'C') {
@@ -333,6 +363,23 @@ static void execute_line(const char *line)
         goto err_syntax;
     }
 
+    /* `PL` one line / `PL 1` `PL 0` `PL S` load + payload live log (5 Hz). */
+    if (up(tokv[0][0]) == 'P' && up(tokv[0][1]) == 'L' && tokv[0][2] == '\0') {
+        if (tokc == 1) { print_payload_log(); return; }
+        if (tokc == 2 && tokv[1][1] == '\0') {
+            char a = up(tokv[1][0]);
+            if (a == '1' || a == '0' || a == 'S') {
+                pl_stream_on   = (a == 'S') ? !pl_stream_on : (a == '1');
+                pl_stream_last = HAL_GetTick();
+                uart_printf("OK: load/payload log %s  (PL,t_ms,handle,pitch_deg,lc_pose,stand_dev_deg,"
+                            "rest_dev_deg,load_status,measured_kg,offer_kg,load_kg,payload_kg,payload_src,assist_on,assist_pose)\r\n",
+                            pl_stream_on ? "ON" : "OFF");
+                return;
+            }
+        }
+        goto err_syntax;
+    }
+
     /* `AS 1` / `AS 0` (enable/disable) / `AS S` (toggle status stream). */
     if (tokc == 2 && up(tokv[0][0]) == 'A' && up(tokv[0][1]) == 'S' && tokv[0][2] == '\0') {
         if (tokv[1][1] != '\0') goto err_syntax;
@@ -353,8 +400,8 @@ static void execute_line(const char *line)
     if (tokc == 2 && up(tokv[0][0]) == 'W' && tokv[0][1] == '\0') {
         if (up(tokv[1][0]) == 'A' && tokv[1][1] == '\0') {
             if (payloadUseLatched())
-                uart_printf("OK: payload = %.1f kg LATCHED from load detection\r\n",
-                            (double)payloadGetKg());
+                uart_printf("OK: load = %.1f kg ACCEPTED -> assist payload %.1f kg\r\n",
+                            (double)payloadGetLoadKg(), (double)payloadGetKg());
             else
                 uart_print("ERR: nothing latched yet - switch the assist ON at STANDING, "
                            "then tip back.\r\n");
@@ -363,7 +410,8 @@ static void execute_line(const char *line)
             float kg = strtof(tokv[1], &end);
             if (end == tokv[1]) goto err_syntax;
             payloadSetManual(kg);
-            uart_printf("OK: payload = %.1f kg MANUAL\r\n", (double)payloadGetKg());
+            uart_printf("OK: load = %.1f kg MANUAL -> assist payload %.1f kg (%.2f x)\r\n",
+                        (double)payloadGetLoadKg(), (double)payloadGetKg(), (double)LOAD_ASSIST_SCALE);
         }
         return;
     }
@@ -473,12 +521,27 @@ void commandPoll(void)
             print_pose_pitch();
         }
     }
+    if (pl_stream_on) {
+        uint32_t now = HAL_GetTick();
+        if ((uint32_t)(now - pl_stream_last) >= 200U) {
+            pl_stream_last = now;
+            print_payload_log();
+        }
+    }
     if (is_stream_on) {
         uint32_t now = HAL_GetTick();
         if ((uint32_t)(now - is_stream_last) >= 100U) {
             is_stream_last = now;
             print_imu_stream();
         }
+    }
+
+    /* RTT input (ST-Link console): same line assembler as the USART ISR. */
+    int c;
+    while (!line_ready && (c = rttGetc()) >= 0) {
+        __disable_irq();
+        rx_char((char)c);
+        __enable_irq();
     }
 
     if (!line_ready) return;
@@ -731,6 +794,7 @@ static void print_help(void)
         "  AS 1 / AS 0      Enable / disable assist (push the truck to move)\r\n"
         "  AS               Assist status (force + per-wheel torque)\r\n"
         "  AS S             Toggle live assist stream: IDLE/FWD/BACK, push+assist N\r\n"
+        "  PL / PL 1 / PL 0 Load + payload live log (5 Hz); handle press at STANDING accepts the load\r\n"
         "  W                Payload in use (LATCHED / MANUAL), latch + load status\r\n"
         "  W <kg> / W A     Manual payload (like the +/- buttons) / back to the latch\r\n"
         "                   Latch: assist ON at STANDING, then tip back -> the last\r\n"

@@ -1,0 +1,41 @@
+{
+  "counts_per_newton": 220.37041738542007,
+  "saved": "2026-11-11T19:06:34",
+  "source": "bench_02_20261111_190159.csv",
+  "unit": "N",
+  "input_unit": "g",
+  "points": [
+    {
+      "known": 0.0,
+      "counts": 911.55,
+      "method": "single"
+    },
+    {
+      "known": 15000.0,
+      "counts": 27371.6,
+      "method": "single"
+    },
+    {
+      "known": 15000.0,
+      "counts": 27823.95,
+      "method": "single"
+    },
+    {
+      "known": 30000.0,
+      "counts": 63640.875,
+      "method": "single"
+    },
+    {
+      "known": 30000.0,
+      "counts": 60694.875,
+      "method": "single"
+    },
+    {
+      "known": 32200.0,
+      "counts": 71124.5,
+      "method": "single"
+    }
+  ],
+  "offset_counts": -2086.4211093939302,
+  "zero_reads_kg": 0.9654460238314854
+}

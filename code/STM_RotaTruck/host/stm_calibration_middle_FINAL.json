@@ -1,0 +1,70 @@
+{
+  "status": "FINAL (bench) - middle strip, CH1, 2 gauges, view x 1",
+  "saved": "2026-11-11T19:06:34",
+  "source_session": "data/strain_gauge/bench_02_20261111_190159.csv",
+  "source_points": "data/strain_gauge/bench_02_20261111_190159_points.csv",
+  "board": "STM32F407G-DISC1, firmware env loadcell_test, HX711 CH1 DT=PE11 SCK=PE12",
+  "hx711_gain": 64,
+  "hx711_full_scale_mV": 22.66,
+  "method": "bench, no IMU (pose gating off, q 0): one tare, then single captures 0 / 15 / 30 / 32.2 kg up and back down",
+  "counts_per_newton": 220.37041738542007,
+  "offset_counts": -2086.4211093939302,
+  "zero_reads_kg": 0.965,
+  "r2": 0.988815,
+  "restore_on_board": [
+    "LD 1",
+    "x 1",
+    "s 220.3704 -2086.4",
+    "z -3028324 0",
+    "LD 0"
+  ],
+  "verified_on_board": "2026-11-11: '# saved scale (view 1) = 220.3704 counts/N (flash)', '# saved offset = -2086 counts = 0.97 kg at the zero'",
+  "fit_error_per_point_kg": {
+    "0.0": 1.39,
+    "15.0 (up)": -1.37,
+    "15.0 (down)": -1.16,
+    "30.0 (up)": 0.41,
+    "30.0 (down)": -0.95,
+    "32.2": 1.68
+  },
+  "limits": [
+    "R^2 0.989 is below the dashboard's 0.99 guide; errors up to about +/-1.7 kg over 0-32 kg.",
+    "Sensitivity rises with load (about 1780 counts/kg at 15 kg, 2040 at 30 kg, 2180 at 32 kg): placement or mechanical non-linearity.",
+    "30 kg up vs down differ by about 1.4 kg (hysteresis).",
+    "Valid only for HX711 gain 64 and the middle view (x 1). Recalibrate on the trolley (tipped-back zero, standing loads) and for the all-6 view."
+  ],
+  "points": [
+    {
+      "known_g": 0.0,
+      "counts": 911.55,
+      "method": "single"
+    },
+    {
+      "known_g": 15000.0,
+      "counts": 27371.6,
+      "method": "single"
+    },
+    {
+      "known_g": 30000.0,
+      "counts": 63640.875,
+      "method": "single"
+    },
+    {
+      "known_g": 32200.0,
+      "counts": 71124.5,
+      "method": "single"
+    },
+    {
+      "known_g": 30000.0,
+      "counts": 60694.875,
+      "method": "single"
+    },
+    {
+      "known_g": 15000.0,
+      "counts": 27823.95,
+      "method": "single"
+    }
+  ],
+  "zero_raw_counts": -3028324,
+  "zero_note": "Zero (tare) in force for the bench_02 calibration points, saved to board flash 2026-11-11 with 'z -3028324 0' (power-up zero). Rest zero / auto-zero then track drift within +/-3 kg after 3 s; handle triple-click (tipped back) re-zeros manually."
+}

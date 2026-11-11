@@ -10,7 +10,7 @@
 #include "odrive_can.h"
 #include "assist_control.h"
 #include "command.h"
-#include "stm32g4xx_hal.h"
+#include "stm32f4xx_hal.h"
 
 #include <math.h>
 #include <stdbool.h>

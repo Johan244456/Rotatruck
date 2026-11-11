@@ -40,6 +40,7 @@ v3 notes
   to make the board reprint it.
 """
 
+import csv
 import json
 import statistics
 import time
@@ -98,7 +99,7 @@ class CalibrationDashboard:
 
         self.root = tk.Tk()
         self.root.title(config["title"])
-        self.root.geometry("1320x900")
+        self.root.geometry("1720x960")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_left()
@@ -106,6 +107,7 @@ class CalibrationDashboard:
         self.calibrated = False
         self.session_scales = {}       # view key -> (counts/N, offset) applied in THIS session only
         self._reset_calibration()
+        self._load_final()
         self._tick()
 
     # ------------------------------------------------------------ calibration storage
@@ -126,6 +128,83 @@ class CalibrationDashboard:
                          "To recalibrate: capture at least 3 paired points, then APPLY.")
         self.capture_status.set("Saved board calibration kept. Calibrate + APPLY to replace it "
                                 "('u' in the command box clears all views).")
+
+    # ------------------------------------------------------------ FINAL calibration
+    def _load_final(self):
+        """Launch / view switch: load this view's accepted calibration
+        (*_FINAL.json) - its points and fit go into the plot and table, and
+        _sync_final() makes sure the board's flash holds the same scale + offset.
+        Capturing more points extends it; 'Clear all' starts fresh."""
+        self.final = None
+        self.final_state = "idle"
+        self._final_t = time.time()
+        path = self.cfg.get("final_file")
+        if not path or not Path(path).exists():
+            return
+        try:
+            d = json.loads(Path(path).read_text())
+            m, c = float(d["counts_per_newton"]), float(d["offset_counts"])
+            pts = [(float(p["known_g"]), float(p["counts"]), p.get("method", "single"))
+                   for p in d.get("points", [])]
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            self.capture_status.set(f"Could not read {Path(path).name}: {e}")
+            return
+        self.final = {"m": m, "c": c, "file": Path(path).name, "saved": d.get("saved", "?"),
+                      "gain": d.get("hx711_gain")}
+        self.final_state = "wait_board"
+        self.points = sorted(pts, key=lambda p: p[0])
+        self._refresh_tree()
+        self._recompute_fit()
+        self.fitted_scale, self.fitted_offset = m, c      # exactly the accepted values
+        self.calibrated = True
+        self.session_scales[self.cfg.get("view_key")] = (m, c)
+        self.capture_status.set(
+            f"FINAL calibration loaded from {self.final['file']} (saved {self.final['saved']}): "
+            f"{m:.4f} counts/N, offset {c:.0f} counts. Checking the board has it...")
+
+    def _sync_final(self):
+        """Once the board reports the saved scale of this view: if it differs from
+        the FINAL file (cleared with 'u', or a different APPLY), send it back."""
+        if not getattr(self, "final", None) or self.final_state in ("idle", "done"):
+            return
+        view = int(self.cfg.get("view_key", 0))
+        if self.reader.board_fact("view") != view:
+            return                                        # 'x <view>' not confirmed yet
+        if self.final_state == "wait_board":
+            if self.reader.board_fact("saved_scale_view") != view:
+                self.reader.send("s")                     # no args: print the saved calibration
+                self.final_state = "queried"
+                self._final_t = time.time()
+                return
+            self.final_state = "queried"
+            self._final_t = time.time()
+        if self.reader.board_fact("saved_scale_view") != view:
+            if time.time() - self._final_t > 5.0:         # ask again if the reply got lost
+                self.final_state = "wait_board"
+            return
+        m, c = self.final["m"], self.final["c"]
+        bs, bo = self.reader.board_fact("saved_scale"), self.reader.board_fact("saved_offset")
+        if bs is not None and bo is None and time.time() - self._final_t < 3.0:
+            return                                        # offset line not in yet
+        gain = round(128 * self._gain_ratio())
+        if self.final.get("gain") and self.reader.board_fact("hx_fs_mv") and gain != self.final["gain"]:
+            self.capture_status.set(
+                f"FINAL calibration NOT applied: it was made at HX711 gain {self.final['gain']}, "
+                f"the board runs gain {gain}. Recalibrate.")
+            self.final_state = "done"
+            return
+        if bs is not None and abs(bs - m) <= 1e-3 * abs(m) and bo is not None and abs(bo - c) <= 1.0:
+            self.capture_status.set(
+                f"FINAL calibration in use: board flash already holds {m:.4f} counts/N, offset "
+                f"{c:.0f} counts ({self.final['file']}).")
+        else:
+            self.reader.send(f"{self.cfg['scale_command']} {m:.4f} {c:.1f}")
+            self.reader.forget_fact("saved_scale_view")
+            self.capture_status.set(
+                f"Board had {'no scale' if bs is None else f'{bs:.4f} counts/N, offset {bo}'}: "
+                f"restored the FINAL calibration ({m:.4f} counts/N, offset {c:.0f}) from "
+                f"{self.final['file']} to flash.")
+        self.final_state = "done"
 
     def _restore_session_calibration(self):
         """After a view switch, show this session's scale for the new view, if
@@ -213,7 +292,7 @@ class CalibrationDashboard:
 
     def _build_right(self):
         # Scrollable right panel, so Step 3 / APPLY is reachable on short screens.
-        outer = ttk.Frame(self.root, width=500)
+        outer = ttk.Frame(self.root, width=760)
         outer.pack(side=tk.RIGHT, fill=tk.Y)
         outer.pack_propagate(False)
         canvas = tk.Canvas(outer, highlightthickness=0)
@@ -264,7 +343,7 @@ class CalibrationDashboard:
         self.match_var = tk.StringVar(value="board banner not seen yet")
         self.match_lbl = tk.Label(right, textvariable=self.match_var,
                                   font=("Consolas", 8), fg="#777",
-                                  justify=tk.LEFT, anchor="w", wraplength=450)
+                                  justify=tk.LEFT, anchor="w", wraplength=720)
         self.match_lbl.pack(fill=tk.X, pady=(0, 6))
 
         # ---- gauge view switch (2 / 4 / 6 strain gauges) ----
@@ -282,7 +361,7 @@ class CalibrationDashboard:
                 self.view_btns[key] = b
             self.view_info = tk.StringVar(value="")
             tk.Label(vbox, textvariable=self.view_info, font=("Segoe UI", 8), fg="#555",
-                     justify=tk.LEFT, anchor="w", wraplength=450).pack(fill=tk.X, pady=(4, 0))
+                     justify=tk.LEFT, anchor="w", wraplength=720).pack(fill=tk.X, pady=(4, 0))
             self._mark_view()
 
         # ---- big readout ----
@@ -290,7 +369,7 @@ class CalibrationDashboard:
         box.pack(fill=tk.X, pady=(0, 8))
         self.big_var = tk.StringVar(value="--")
         self.big_lbl = tk.Label(box, textvariable=self.big_var,
-                                font=("Segoe UI", 46, "bold"))
+                                font=("Segoe UI", 34, "bold"))
         self.big_lbl.pack()
         self.big_sub_var = tk.StringVar(value="")
         self.big_sub_lbl = tk.Label(box, textvariable=self.big_sub_var,
@@ -303,7 +382,7 @@ class CalibrationDashboard:
         # ---- payload validity and assist (sketch v3.6) ----
         self.assist_on = bool(self.cfg.get("assist"))
         if self.assist_on:
-            abox = ttk.LabelFrame(right, text="Assist output (safety factor 0.9)",
+            abox = ttk.LabelFrame(right, text="Assist output (safety factor from board, LOAD_ASSIST_SCALE)",
                                   padding=8)
             abox.pack(fill=tk.X, pady=(0, 8))
             self.assist_state_var = tk.StringVar(value="payload: waiting for board")
@@ -312,7 +391,7 @@ class CalibrationDashboard:
             self.assist_state_lbl.pack(anchor="w")
             self.assist_big_var = tk.StringVar(value="--")
             self.assist_big_lbl = tk.Label(abox, textvariable=self.assist_big_var,
-                                           font=("Segoe UI", 28, "bold"))
+                                           font=("Segoe UI", 20, "bold"))
             self.assist_big_lbl.pack(anchor="w")
             # load vs rated payload visualiser
             self.load_pct_var = tk.StringVar(value="load: --")
@@ -387,6 +466,20 @@ class CalibrationDashboard:
         self.imu_mode_lbl = tk.Label(irow, textvariable=self.imu_mode_var, font=("Segoe UI", 9, "bold"))
         self.imu_mode_lbl.pack(side=tk.LEFT, padx=6)
 
+        # ---- simulated pose (env:loadcell_test only, bench tests without an IMU) ----
+        srow = ttk.Frame(cmd)
+        srow.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(srow, text="Simulated pose (no IMU):").pack(side=tk.LEFT)
+        for label, m in (("Standing", "s"), ("Tipped back", "r"), ("Tilting", "t"),
+                         ("off (real IMU)", "0")):
+            ttk.Button(srow, text=label, width=13 if m != "0" else 14,
+                       command=lambda m=m: self._sim_pose(m)).pack(side=tk.LEFT, padx=2)
+        tk.Label(cmd, text="Bench only (loadcell_test firmware): stands in for the IMU so the "
+                           "tipped-back zero / standing capture logic runs as on the truck. "
+                           "Keep IMU mode on 'use IMU' (gating on).",
+                 font=("Segoe UI", 8), fg="#777", justify=tk.LEFT, anchor="w",
+                 wraplength=710).pack(fill=tk.X)
+
         crow = ttk.Frame(cmd)
         crow.pack(fill=tk.X, pady=(4, 0))
         self.cmd_entry = ttk.Entry(crow)
@@ -426,7 +519,7 @@ class CalibrationDashboard:
         self.capture_status = tk.StringVar(
             value="Paired capture is drift safe. Use 'single' only for a quick look.")
         tk.Label(cap, textvariable=self.capture_status, fg="#1565c0",
-                 font=("Segoe UI", 9), wraplength=440,
+                 font=("Segoe UI", 9), wraplength=710,
                  justify=tk.LEFT, anchor="w").pack(fill=tk.X)
 
         self.tree = ttk.Treeview(cap, columns=("known", "counts", "how"),
@@ -454,7 +547,7 @@ class CalibrationDashboard:
         fitbox.pack(fill=tk.X, pady=(0, 6))
         self.fit_var = tk.StringVar(value="Capture at least 2 points.")
         tk.Label(fitbox, textvariable=self.fit_var, font=("Consolas", 9),
-                 justify=tk.LEFT, anchor="w", wraplength=440).pack(fill=tk.X)
+                 justify=tk.LEFT, anchor="w", wraplength=710).pack(fill=tk.X)
         self.apply_btn = ttk.Button(fitbox, text="APPLY scale to board",
                                     command=self._apply_scale, state=tk.DISABLED)
         self.apply_btn.pack(fill=tk.X, pady=3)
@@ -501,12 +594,26 @@ class CalibrationDashboard:
         if spread == 0:
             return ("SIGNAL FROZEN", "#c62828",
                     "Raw value identical across every sample. HX711 is likely\n"
-                    "not converting: check DT / SCK (CH1 D2/D3, CH2 D4/D5), 3V3, GND.")
+                    "not converting: check DT / SCK (CH1 PE11/PE12, CH2 PE13/PE14), 3V, GND.")
 
-        detail = (f"noise sd = {sd:,.0f} counts  ({sd / self.cfg['counts_per_unit']:.3f} "
+        detail = (f"noise sd = {sd:,.0f} counts  ({sd / self._cpu():.3f} "
                   f"{self.cfg['unit_small']})\n"
                   f"spread over last {len(raws)} samples = {spread:,.0f} counts")
         return "SENSOR DETECTED", "#2e7d32", detail
+
+    def _gain_ratio(self):
+        """HX711 gain on the board / 128, from its banner (AVDD + full scale).
+        The view's counts/ustrain are computed for gain 128."""
+        avdd = self.reader.board_fact("hx_avdd")
+        fs = self.reader.board_fact("hx_fs_mv")
+        if not avdd or not fs:
+            return 1.0
+        gain = round(0.5 * avdd * 1000.0 / fs)
+        return gain / 128.0 if gain in (32, 64, 128) else 1.0
+
+    def _cpu(self):
+        """counts/ustrain for the current view at the board's gain."""
+        return self.cfg["counts_per_unit"] * self._gain_ratio()
 
     def _check_board_match(self):
         """Warn loudly if the host's config or completion disagrees with the sketch's."""
@@ -518,7 +625,10 @@ class CalibrationDashboard:
         board_cpu = self.reader.board_fact("counts_per_ustrain")
         if board_cpu is None:
             return
-        host_cpu = self.cfg["counts_per_unit"]
+        host_cpu = self._cpu()
+        fs = self.reader.board_fact("hx_fs_mv")
+        if fs:
+            self.cfg["fs_mv"] = fs
         cfg_name = self.reader.board_fact("config", "?")
         off = self.reader.board_fact("predicted_offset_mv")
         bits = [f"board {cfg_name}, {board_cpu:,.1f} counts/{self.cfg['unit_small']}"]
@@ -526,6 +636,8 @@ class CalibrationDashboard:
             bits.append(f"comp {r2:g}/{r4:g} ohm")
         if off is not None:
             bits.append(f"predicted offset {off:+.2f} mV")
+        if fs:
+            bits.append(f"HX711 gain {round(128 * self._gain_ratio())} (+/-{fs:.1f} mV)")
 
         problems = []
         if abs(board_cpu - host_cpu) / max(abs(board_cpu), 1e-9) > 0.001:
@@ -594,7 +706,9 @@ class CalibrationDashboard:
                         calib_file=v["calib_file"], scale_label=v["scale_label"],
                         default_scale=v["default_scale"])
         self.root.title(f"{self.cfg['title_base']} - {v['label']}")
-        self.reader.forget_fact("counts_per_ustrain", "bridge_factor", "config", "view")
+        self.reader.forget_fact("counts_per_ustrain", "bridge_factor", "config", "view",
+                                "saved_scale_view", "saved_scale", "saved_offset")
+        self.cfg["final_file"] = None if self.cfg.get("no_final") else v.get("final_file")
         self.reader.send(v["x_cmd"])
         self.points.clear()
         self._refresh_tree()
@@ -604,6 +718,7 @@ class CalibrationDashboard:
         self.raw_buffer.clear()
         self.t_hist.clear()
         self.v_hist.clear()
+        self._load_final()                 # this view's accepted calibration, if any
         self._mark_view()
         self._restore_session_calibration()
         self.fit_var.set(self.fit_var.get() if self.calibrated else
@@ -629,6 +744,14 @@ class CalibrationDashboard:
                         "and still (steps up to 3 kg).",
                  "a 0": "Zero tracking OFF: use this while watching drift by eye."}
         self.capture_status.set(hints.get(cmd, f"sent '{cmd}'"))
+
+    def _sim_pose(self, m):
+        """Simulated pose 'q f s|r|t|0' (env:loadcell_test only). Turns pose
+        gating on first if it is off, since the simulated pose only matters
+        with gating."""
+        if m != "0" and self.reader.board_fact("pose_gating") is False:
+            self.reader.send("q 1")
+        self.reader.send(f"q f {m}")
 
     def _set_imu_mode(self, use_imu):
         """'q 1' = pose gating with the IMU, 'q 0' = no IMU: every reading is
@@ -738,6 +861,7 @@ class CalibrationDashboard:
         loaded = statistics.mean(self.capture_buffer)
         spread = max(self.capture_buffer) - min(self.capture_buffer)
         counts = loaded - self.pair_zero
+        self._log_point(self.capture_target, counts, "pair", spread, loaded, self.pair_zero)
         self.points.append((self.capture_target, counts, "pair"))
         self.points.sort(key=lambda p: p[0])
         self._refresh_tree()
@@ -756,6 +880,7 @@ class CalibrationDashboard:
     def _finish_capture(self):
         counts = statistics.mean(self.capture_buffer)
         spread = max(self.capture_buffer) - min(self.capture_buffer)
+        self._log_point(self.capture_target, counts, "single", spread, counts, None)
         self.points.append((self.capture_target, counts, "single"))
         self.points.sort(key=lambda p: p[0])
         self._refresh_tree()
@@ -803,6 +928,7 @@ class CalibrationDashboard:
                 self._set_apply(tk.DISABLED)
                 return
             self.fitted_scale, self.fitted_offset = m, c
+            self.fitted_r2 = r2
             span_in = [min(0.0, min(xs_in)), max(xs_in)]       # show where the line meets zero load
             self.fit_line.set_data(span_in,
                                    [m * x * self.in_to_unit + c for x in span_in])
@@ -810,7 +936,7 @@ class CalibrationDashboard:
             self.res_pts.set_data(xs_in, residuals)
             max_res = max(abs(r) for r in residuals)
 
-            guess = self.cfg["default_scale"]
+            guess = self.cfg["default_scale"] * self._gain_ratio()
             ratio = m / guess if guess else float("nan")
             per_in = (f"counts per {self.in_unit:<3}    = {m * self.in_to_unit:,.4f}\n"
                       if self.in_unit != self.cfg["unit"] else "")
@@ -859,9 +985,69 @@ class CalibrationDashboard:
             where = f" and saved to {self._calib_path().name}" if self._calib_path() else ""
         except OSError as e:
             where = f" (could not save file: {e})"
+        logged = self._log_apply(m, c)
         self.capture_status.set(
             f"Applied: {cmd}  ({m:,.2f} counts/{self.cfg['unit']}, offset {c:,.0f} counts). "
-            f"Stored in the board's flash{where}. It stays until you APPLY again or send 'u'.")
+            f"Stored in the board's flash{where}. It stays until you APPLY again or send 'u'."
+            + (f" Logged to {logged}." if logged else ""))
+
+    # ------------------------------------------------------------ data log
+    def _log_dir(self):
+        f = getattr(self.reader, "filename", None)
+        return Path(f).parent if f else None
+
+    def _log_point(self, known, counts, method, spread, loaded, zero):
+        """Every captured point, applied or not: <session>_points.csv."""
+        f = getattr(self.reader, "filename", None)
+        if not f:
+            return
+        path = Path(f).with_name(Path(f).stem + "_points.csv")
+        new = not path.exists()
+        try:
+            with open(path, "a", newline="") as fh:
+                w = csv.writer(fh)
+                if new:
+                    w.writerow(["time", "view", f"known_{self.in_unit}", "counts", "method",
+                                "spread_counts", "loaded_counts", "zero_counts", "pose", "hx711_gain"])
+                w.writerow([datetime.now().isoformat(timespec="seconds"), self.cfg.get("view_key"),
+                            known, f"{counts:.1f}", method, f"{spread:.0f}",
+                            f"{loaded:.1f}", "" if zero is None else f"{zero:.1f}",
+                            self._pose_now(), round(128 * self._gain_ratio())])
+        except OSError:
+            pass
+
+    def _log_apply(self, m, c):
+        """Each APPLY: one line in calibration_history.csv plus a full JSON record
+        (fit + every point) next to the session CSV. Returns the history file name."""
+        d = self._log_dir()
+        if not d:
+            return None
+        stamp = datetime.now()
+        session = Path(self.reader.filename).stem
+        try:
+            hist = d / "calibration_history.csv"
+            new = not hist.exists()
+            with open(hist, "a", newline="") as fh:
+                w = csv.writer(fh)
+                if new:
+                    w.writerow(["time", "session", "view", "counts_per_N", "offset_counts",
+                                "zero_reads_kg", "r2", "n_points", "methods", "hx711_gain",
+                                "points (known:counts)"])
+                w.writerow([stamp.isoformat(timespec="seconds"), session, self.cfg.get("view_key"),
+                            f"{m:.4f}", f"{c:.1f}", f"{self._offset_kg(m, c):+.3f}",
+                            f"{getattr(self, 'fitted_r2', float('nan')):.6f}", len(self.points),
+                            "/".join(sorted({p[2] for p in self.points})),
+                            round(128 * self._gain_ratio()),
+                            " ".join(f"{k:g}:{n:.0f}" for k, n, _ in self.points)])
+            rec = {"time": stamp.isoformat(timespec="seconds"), "session_csv": Path(self.reader.filename).name,
+                   "view": self.cfg.get("view_key"), "counts_per_N": m, "offset_counts": c,
+                   "zero_reads_kg": self._offset_kg(m, c), "r2": getattr(self, "fitted_r2", None),
+                   "hx711_gain": round(128 * self._gain_ratio()), "input_unit": self.in_unit,
+                   "points": [{"known": k, "counts": n, "method": how} for k, n, how in self.points]}
+            (d / f"{session}_applied_{stamp:%H%M%S}.json").write_text(json.dumps(rec, indent=2))
+            return hist.name
+        except OSError:
+            return None
 
     def _save_zero(self):
         self.reader.send("z")
@@ -892,7 +1078,7 @@ class CalibrationDashboard:
         name = self.STATUS_NAMES.get(status, f"status {status}")
         measured_kg = s[self.cfg["value_field"]] / 9.80665
         rated = self.reader.board_fact("rated_kg")
-        sf = self.reader.board_fact("assist_sf", 0.9)
+        sf = self.reader.board_fact("assist_sf", 0.7)
 
         if status == 8:
             self.assist_state_var.set("payload HELD - not standing, assist from the last standing reading")
@@ -995,6 +1181,7 @@ class CalibrationDashboard:
 
         self._check_board_match()
         self._update_imu_mode()
+        self._sync_final()
 
         warn = self.cfg.get("warn_above")
         colour = "#c62828" if (warn and abs(value) > warn) else "#1565c0"

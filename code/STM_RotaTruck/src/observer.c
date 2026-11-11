@@ -21,7 +21,7 @@
 #include "board.h"
 #include "odrive_can.h"
 #include "imu.h"
-#include "stm32g4xx_hal.h"
+#include "stm32f4xx_hal.h"
 
 #include <math.h>
 

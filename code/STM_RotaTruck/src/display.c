@@ -61,7 +61,7 @@ static void right_field(char *out, size_t n)
         return;
     }
     bool manual = payloadIsManual();
-    int kg = (int)(payloadGetKg() + 0.5f);
+    int kg = (int)(payloadGetLoadKg() + 0.5f);    /* the load the operator set / accepted */
     if (kg < 0)   kg = 0;
     if (kg > 999) kg = 999;
     snprintf(out, n, manual ? "%dkgM" : "%dkg", kg);

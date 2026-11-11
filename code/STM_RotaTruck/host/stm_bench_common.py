@@ -52,12 +52,17 @@ _FACT_PATTERNS = {
     "comp_ohm":           re.compile(r"gauge / comp\s*=\s*[\d.]+\s*/\s*([\d.]+)"),
     "rated_kg":           re.compile(r"rated payload\s*=\s*([\d.]+)\s*kg"),
     "assist_sf":          re.compile(r"assist safety factor\s*=\s*([\d.]+)"),
+    # HX711 range -> gain (F407 firmware can run gain 64 for an offset bridge)
+    "hx_avdd":            re.compile(r"HX711 AVDD\s*=\s*([\d.]+)\s*V"),
+    "hx_fs_mv":           re.compile(r"full scale\s*\+/-\s*([\d.]+)\s*mV"),
 }
 _COMP_PAIR_RE = re.compile(r"comp R2 / R4\s*=\s*([\d.]+)\s*/\s*([\d.]+)")
-_CONFIG_RE = re.compile(r"(?:Uno R3|NUCLEO-G491RE) - (\w+)")
+_CONFIG_RE = re.compile(r"(?:Uno R3|NUCLEO-G491RE|STM32F407 DISC1) - (\w+)")
 _VIEW_RE = re.compile(r"#\s*view\s*=\s*x\s*(\d)")
 _GATING_RE = re.compile(r"#\s*pose gating\s*=\s*(ON|OFF)")      # firmware v4.2
-_IMU_RE = re.compile(r"#\s*IMU\s*=\s*(ISM330DHCX|NOT FOUND)")
+_SAVED_SCALE_RE = re.compile(r"saved scale \(view (\d)\)\s*=\s*(none|[-\d.]+)")
+_SAVED_OFF_RE = re.compile(r"saved offset\s*=\s*([-\d.]+)\s*counts")
+_IMU_RE = re.compile(r"#\s*IMU\s*=\s*(ISM330DHCX|SIMULATED|NOT FOUND)")
 
 
 class SerialReader:
@@ -151,6 +156,14 @@ class SerialReader:
         m = _GATING_RE.search(line)
         if m:
             found["pose_gating"] = m.group(1) == "ON"
+        m = _SAVED_SCALE_RE.search(line)
+        if m:                          # print_cal: scale first, then (if any) offset
+            found["saved_scale_view"] = int(m.group(1))
+            found["saved_scale"] = None if m.group(2) == "none" else float(m.group(2))
+            found["saved_offset"] = None
+        m = _SAVED_OFF_RE.search(line)
+        if m:
+            found["saved_offset"] = float(m.group(1))
         m = _IMU_RE.search(line)
         if m:
             found["imu_found"] = m.group(1) != "NOT FOUND"
@@ -160,8 +173,10 @@ class SerialReader:
 
     def _run(self):
         try:
-            ser = serial.Serial()
-            ser.port = self.port
+            # serial_for_url: a COM port name, or a URL such as
+            # socket://localhost:9090 (F407 Discovery: RTT over the ST-Link,
+            # served by tools/rtt_server.sh - its USB COM port isn't wired).
+            ser = serial.serial_for_url(self.port, do_not_open=True)
             ser.baudrate = self.baud
             ser.timeout = 1
             ser.dtr = False          # don't glitch-reset the board on connect

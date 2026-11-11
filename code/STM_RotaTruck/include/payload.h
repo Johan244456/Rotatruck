@@ -15,7 +15,7 @@ extern "C" {
  *    1. The assist is switched ON (D8 / B1 button, or AS 1) while the
  *       truck is in STANDING.  This "arms" the latch for that session.
  *    2. While standing, the last VALID live load-detect reading (status OK
- *       or OVERLOAD) is remembered: 0.9 x measured, capped at rated.
+ *       or OVERLOAD) is remembered: LOAD_ASSIST_SCALE x measured, capped at rated.
  *    3. On the STANDING -> DRIVE (tipped back) transition, that final
  *       reading is LATCHED as the assist payload and stays fixed for the
  *       push.  Every later STANDING -> DRIVE in the same armed session
@@ -29,7 +29,13 @@ extern "C" {
  *      payload and take over immediately (also overriding a latch, starting
  *      from the value in use).  The next armed STANDING -> DRIVE latches
  *      load detection again.
- *  The manual payload starts at 0 kg on power-up (not saved).
+ *  The manual payload starts at PAYLOAD_DEFAULT_KG on power-up (not saved).
+ *
+ *  F407 (board.h PAYLOAD_ACCEPT_ON_HANDLE 1) replaces the LATCH RULE: a
+ *  HANDLE SWITCH press while the load-detect pose is STANDING accepts the
+ *  last settled standing reading (<= PAYLOAD_ACCEPT_MAX_AGE_MS old) as
+ *  LOAD_ASSIST_SCALE (0.7) x measured; otherwise it is refused with the
+ *  reason and the payload in use is kept.
  * =====================================================================*/
 
 void  payloadInit(void);
@@ -39,7 +45,8 @@ void  payloadInit(void);
 void  payloadUpdate(void);
 
 /* Payload the assist is using now, and whether it is the manual value. */
-float payloadGetKg(void);
+float payloadGetKg(void);          /* ASSIST payload = LOAD_ASSIST_SCALE x initialised load */
+float payloadGetLoadKg(void);      /* the initialised load (accepted / default / W / buttons) */
 bool  payloadIsManual(void);
 
 /* Manual payload: +/- buttons (delta) and `W <kg>` (absolute).  Both switch

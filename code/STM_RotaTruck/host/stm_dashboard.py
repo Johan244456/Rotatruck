@@ -6,6 +6,8 @@ Run it
   python stm_dashboard.py                    start window: port, test name, gauges
   python stm_dashboard.py COM7 test_30       straight in, all 6 gauges (combined)
   python stm_dashboard.py COM7 test_30 --view 2
+  F407 Discovery: tools/rtt_server.sh in another terminal, then
+  python3 stm_dashboard.py socket://localhost:9090 test_30
 Double-clicking the file, or Run in VS Code, opens the start window.
 
 Gauge views (switchable live with the "Gauges shown" buttons):
@@ -36,7 +38,7 @@ GAUGE_FACTOR = 2.0
 R_GAUGE = 350.0
 COMP_CHOICES = (330.0, 350.0) # CH1 completion resistors on hand
 R_COMP_DEFAULT = 350.0
-HX_AVDD = 3.2                 # HX711 VCC from the Nucleo 3V3
+HX_AVDD = 2.9                 # HX711 VCC from the F407 DISC1 3V pin (gain/range read from the board)
 HX_FS_MV = 0.5 * HX_AVDD / 128 * 1000.0
 BAUD_DEFAULT = 115200
 # ------------------------------------------------------------------------
@@ -62,6 +64,8 @@ def view_config(key):
     return {
         "button": button, "label": label, "config": config, "config_name": cname,
         "x_cmd": x_cmd, "calib_file": str(HERE / calib), "counts_per_unit": cpu,
+        # accepted calibration for this view, loaded + kept on the board at launch
+        "final_file": str(HERE / calib.replace(".json", "_FINAL.json")),
         "default_scale": cpu / 0.05,
         "scale_label": "Slope is counts per newton. The board converts it with\n"
                        f"{cpu:.1f} counts/ustrain ({cname}, factor {factor:.2f}).",
@@ -69,12 +73,18 @@ def view_config(key):
 
 
 # ---------------------------------------------------------------- start window
+# F407 Discovery: its ST-Link COM port is not wired to the MCU; the console
+# runs over RTT, served on this socket by tools/rtt_server.sh.  Listed first
+# (and matched by the "stm32" auto-pick) so it is the default choice.
+RTT_PORT = ("socket://localhost:9090", "STM32F407 Discovery over RTT (start tools/rtt_server.sh first)")
+
+
 def list_ports():
     try:
         from serial.tools import list_ports as lp
-        return [(p.device, p.description) for p in lp.comports()]
+        return [RTT_PORT] + [(p.device, p.description) for p in lp.comports()]
     except Exception:
-        return []
+        return [RTT_PORT]
 
 
 def next_test_name():
@@ -177,7 +187,8 @@ def start_window():
 
 
 # ---------------------------------------------------------------- dashboard
-def run_dashboard(port, test_name, view="0", rcomp=None, baud=BAUD_DEFAULT):
+def run_dashboard(port, test_name, view="0", rcomp=None, baud=BAUD_DEFAULT, no_imu=False,
+                  no_final=False):
     from stm_bench_common import SerialReader
     from stm_calib_gui import CalibrationDashboard
 
@@ -194,6 +205,11 @@ def run_dashboard(port, test_name, view="0", rcomp=None, baud=BAUD_DEFAULT):
     if rcomp is not None:
         reader.send(f"r {rcomp:g}")
     reader.send("m 1")                     # rig standard: stable-hold filter
+    if no_imu:
+        # Bench calibration without the IMU: pose gating off ('q 0', saved on the
+        # board), so readings are always live and the dashboard skips its
+        # tipped-back / standing checks. Click "use IMU" ('q 1') to go back.
+        reader.send("q 0")
 
     title_base = f"STM32 Strain Gauge Calibration - {test_name}"
     config = {
@@ -213,6 +229,8 @@ def run_dashboard(port, test_name, view="0", rcomp=None, baud=BAUD_DEFAULT):
         "input_unit": "g",
         "input_to_unit": 9.80665 / 1000.0,
         "calib_file": v["calib_file"],
+        "final_file": None if no_final else v["final_file"],
+        "no_final": no_final,
         "counts_per_unit": v["counts_per_unit"],
         "unit_small": "ustrain",
         "scale_command": "s",
@@ -242,8 +260,13 @@ def main():
                     help="0 all 6 combined, 1 middle 2 SG, 2 left + right 4 SG")
     ap.add_argument("--rcomp", type=float, default=None)
     ap.add_argument("--baud", type=int, default=BAUD_DEFAULT)
+    ap.add_argument("--no-imu", action="store_true",
+                    help="bench calibration without the IMU: pose gating off (q 0) on connect")
+    ap.add_argument("--no-final", action="store_true",
+                    help="don't load / restore the view's *_FINAL.json calibration on launch")
     a = ap.parse_args()
-    run_dashboard(a.port, a.test_name, a.view, a.rcomp, a.baud)
+    run_dashboard(a.port, a.test_name, a.view, a.rcomp, a.baud, no_imu=a.no_imu,
+                  no_final=a.no_final)
 
 
 if __name__ == "__main__":

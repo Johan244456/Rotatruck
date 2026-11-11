@@ -21,7 +21,7 @@ extern "C" {
  *    - Pose comes from the shared IMU layer (imu.c, ISM330DHCX) instead of
  *      its own I2C driver.
  *
- *  It only MEASURES: status + 0.9 x measured load (0 on any fault or before
+ *  It only MEASURES: status + LOAD_ASSIST_SCALE x measured load (0 on any fault or before
  *  calibration).  payload.c latches the last valid standing value into the
  *  assist on STANDING -> tipped back (if the assist was switched on at
  *  STANDING), with the +/- buttons as the manual fallback.
@@ -57,9 +57,21 @@ loadcell_status_t loadcellStatus(void);
 const char *loadcellStatusName(void);         /* "OK", "NO_CAL", ...        */
 const char *loadcellStatusShort(void);        /* <= 5 chars, for the LCD    */
 bool  loadcellValid(void);                    /* OK, OVERLOAD or HELD       */
-float loadcellAssistKg(void);                 /* 0.9 x measured, 0 on fault */
+float loadcellAssistKg(void);                 /* LOAD_ASSIST_SCALE x measured, 0 on fault */
 float loadcellMeasuredKg(void);               /* latest reading, any status */
 /* Which value reaches the assist (latch / manual) is decided in payload.c. */
+
+/* Pose as load detection sees it (IMU gravity vs the `q s` / `q r` references). */
+bool  loadcellImuOk(void);
+bool  loadcellPoseStanding(void);             /* within ~5 deg of the standing pose */
+bool  loadcellPoseTipped(void);               /* >= 15 deg back from it (driving position) */
+float loadcellStandDevDeg(void);              /* degrees away from the standing pose */
+float loadcellRestDevDeg(void);               /* degrees away from the FULL tipped-back pose (q r) */
+const char *loadcellPoseName(void);
+
+/* Manual zero from the handle triple click: only at / near tipped back, uses
+ * samples from before first_press_ms, RAM only.  False (reason printed) if refused. */
+bool  loadcellZeroFromHandle(uint32_t first_press_ms);
 
 #ifdef __cplusplus
 }

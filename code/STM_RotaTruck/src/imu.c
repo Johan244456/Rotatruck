@@ -56,6 +56,13 @@ static float ax_ms2_corrected = 0.0f;
  * after an interrupted transfer (MCU reset mid-read, or motor/CAN noise
  * glitching the bus).  Leaves PB8/PB9 as GPIO; HAL_I2C_Init's MspInit puts
  * them back on AF4. */
+/* [F4] ~5 us busy-wait (no HAL_Delay: the bus clear also runs from the
+ * main loop while the motors may be live, and 9 x 2 ms would stall it). */
+static void bus_half_period(void)
+{
+    for (volatile uint32_t i = 0; i < (SystemCoreClock / 1000000U) * 5U / 4U; i++) { }
+}
+
 static void i2c_bus_clear_pins(void)
 {
     GPIO_InitTypeDef g = {0};
@@ -68,15 +75,15 @@ static void i2c_bus_clear_pins(void)
     g.Pin = IMU_I2C_SDA_PIN; HAL_GPIO_Init(IMU_I2C_SDA_PORT, &g);
     for (int i = 0; i < 9; i++) {
         HAL_GPIO_WritePin(IMU_I2C_SCL_PORT, IMU_I2C_SCL_PIN, GPIO_PIN_RESET);
-        HAL_Delay(1);
+        bus_half_period();
         HAL_GPIO_WritePin(IMU_I2C_SCL_PORT, IMU_I2C_SCL_PIN, GPIO_PIN_SET);
-        HAL_Delay(1);
+        bus_half_period();
     }
     /* STOP: SDA low->high while SCL is high. */
     HAL_GPIO_WritePin(IMU_I2C_SDA_PORT, IMU_I2C_SDA_PIN, GPIO_PIN_RESET);
-    HAL_Delay(1);
+    bus_half_period();
     HAL_GPIO_WritePin(IMU_I2C_SDA_PORT, IMU_I2C_SDA_PIN, GPIO_PIN_SET);
-    HAL_Delay(1);
+    bus_half_period();
 }
 
 static bool i2c_peripheral_init(void)
@@ -115,6 +122,9 @@ static uint32_t s_retry_ms = 0;
 
 bool imuBegin(void)
 {
+#if !IMU_ENABLE
+    return false;              /* board.h IMU_ENABLE 0: never started, even if wired */
+#endif
     i2c_bus_clear_pins();
     if (!i2c_peripheral_init()) return false;
     /* WHO_AM_I at 0x6B (or 0x6A) + configure.  Retried: right after an
@@ -140,7 +150,16 @@ static void lazy_reinit(void)
     uint32_t now = HAL_GetTick();
     if ((uint32_t)(now - s_retry_ms) < IMU_RETRY_PERIOD_MS) return;
     s_retry_ms = now;
-    if (hi2c_imu.State == HAL_I2C_STATE_RESET && !i2c_peripheral_init()) return;
+    /* [F4] Full recovery every attempt: a disturbed / unplugged bus leaves the
+     * F4 I2C peripheral latched BUSY, and without a de-init + bus clear +
+     * re-init no transfer ever succeeds again - the IMU would only come back
+     * after a reset.  The clear is ~0.1 ms (busy-wait), so the loop isn't stalled. */
+    if (hi2c_imu.State == HAL_I2C_STATE_RESET) {
+        i2c_bus_clear_pins();
+        if (!i2c_peripheral_init()) return;
+    } else {
+        i2c_bus_recover();
+    }
     s_ok = ism330Begin();
     if (s_ok) uart_print("IMU: ISM330DHCX configured (recovered).\r\n");
 }
@@ -159,7 +178,8 @@ bool imuIsPresent(void) { return s_ok && ism330IsPresent(); }
 void imuScanBus(void)
 {
     if (hi2c_imu.State == HAL_I2C_STATE_RESET) {
-        uart_print("I2C scan: bus not initialised.\r\n");
+        uart_print(IMU_ENABLE ? "I2C scan: bus not initialised.\r\n"
+                              : "I2C scan: skipped - IMU disabled (IMU_ENABLE 0), I2C1 not started.\r\n");
         return;
     }
     uart_print("I2C scan (I2C1: SDA=PB9/D14, SCL=PB8/D15):\r\n");
@@ -205,6 +225,9 @@ static bool read_cart_frame(void)
 
 bool imuRead(void)
 {
+#if !IMU_ENABLE
+    return false;              /* no lazy re-init either: the IMU stays off */
+#endif
     if (!s_ok) {
         lazy_reinit();
         if (!s_ok) return false;

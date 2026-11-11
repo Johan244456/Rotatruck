@@ -25,7 +25,7 @@
  *  Sensors / UI:
  *    ISM330DHCX IMU : I2C1 on PB8/PB9 (D14/D15), 0x6B
  *    16x2 LCD       : same I2C1 bus via PCF8574 backpack
- *    2 x HX711      : PA10/PB3 (CH1), PB5/PB4 (CH2) - load detection
+ *    2 x HX711      : PE11/PE12 (CH1), PE13/PE14 (CH2) - load detection, LED PD12
  *    Button         : PA9 (assist toggle), active-high with pull-down
  *
  *  Debug:
@@ -165,6 +165,59 @@
 #define UI_MODE_BUTTON_DEBOUNCE_MS  40U            /* level-stable time to commit */
 #define UI_PAYLOAD_STEP_KG          5.0f           /* +/- per button press */
 #define UI_PAYLOAD_MAX_KG           250.0f         /* clamp ceiling */
+/* Initialised LOAD at power-up (kg): used until a load is accepted with the
+ * handle or set with the +/- buttons / `W <kg>`.  The assist always gets
+ * LOAD_ASSIST_SCALE x the initialised load (15 kg -> 10.5 kg).  The original
+ * default was 0. */
+#define PAYLOAD_DEFAULT_KG          15.0f
+
+/* Fraction of the MEASURED load handed to the assist (observer mass): the
+ * assist must never be sized above the real load (no over-assist), so it is
+ * deliberately under-sized.  Was 0.9; 0.7 for the DISC1 trials.  Used by
+ * load detection (loadcell.c) and the accepted payload (payload.c). */
+#define LOAD_ASSIST_SCALE           0.7f
+
+/* Accept the load with the HANDLE SWITCH: one click, while the IMU says the
+ * trolley is at the standing angle (within 5 deg of the captured `q s`
+ * reference), takes the last settled standing reading (from the
+ * PAYLOAD_ACCEPT_MAX_AGE_MS before the press - gripping the handle disturbs
+ * the plate) and sets the assist payload to LOAD_ASSIST_SCALE x measured.
+ * Not standing / no valid reading -> refused with the reason, payload kept.
+ * 0 = original rule (latch on STANDING -> DRIVE after arming at STANDING). */
+#define PAYLOAD_ACCEPT_ON_HANDLE    1
+#define PAYLOAD_ACCEPT_MAX_AGE_MS   3000U
+/* Accept only at the STANDING angle itself: the IMU must be within this many
+ * degrees of the captured standing pose (`q s`) at the click, and the reading
+ * accepted must have been taken that close too.  (The live STANDING zone for
+ * load detection stays at ~5 deg.)  ~2 deg = "exactly" standing within IMU noise. */
+#define PAYLOAD_ACCEPT_MAX_DEV_DEG  2.0f
+
+/* AUTO-ACCEPT: whenever the trolley is exactly upright (<= PAYLOAD_ACCEPT_MAX_DEV_DEG)
+ * and the reading has settled, the detected load becomes the load - no click
+ * needed.  It stays frozen while tipped back / driving; standing up again
+ * re-reads the TOTAL on the plate, so load can be added between drives.
+ * Updates only when it differs by more than PAYLOAD_AUTO_MIN_CHANGE_KG.
+ * (One click still accepts manually.)  0 = click only. */
+#define PAYLOAD_AUTO_ACCEPT         1
+#define PAYLOAD_AUTO_MIN_CHANGE_KG  0.5f
+
+/* One pose definition for the whole system: the motor pose machine
+ * (assist_control.c: STANDING = wheels held, DRIVING = assist) uses the SAME
+ * captured references as load detection (`q s` standing / `q r` tipped back)
+ * instead of the fixed pitch thresholds tuned for the truck's IMU mounting.
+ *   STANDING   = within ~5 deg of `q s`   -> wheels held, load accepted here
+ *   TIPPED BACK= >= 15 deg back from it    -> assist drives (0.7 x load)
+ *   in between = keeps the previous pose;  IMU lost = STANDING (wheels held)
+ * 0 = original pitch thresholds (POSE_*_ENTER_DEG in assist_tuning.h). */
+#define POSE_FROM_LOAD_REFS         1
+
+/* Assist only when tipped back FULLY: the motors are released to the assist
+ * only within POSE_DRIVE_FULL_ENTER_DEG of the captured tipped-back pose (`q r`),
+ * and keep assisting until more than POSE_DRIVE_FULL_EXIT_DEG away (so normal
+ * handle movement while pushing doesn't toggle it).  Anywhere else - upright,
+ * partly tilted, IMU lost - the wheels are held. */
+#define POSE_DRIVE_FULL_ENTER_DEG   5.0f
+#define POSE_DRIVE_FULL_EXIT_DEG    10.0f
 
 /* Handle safety (dead-man) switch — PE7 (DISC1 header P1).  deadman.c.
  * (Was A0/PA0 on the Nucleo; on the F407 Discovery PA0 is the blue USER
@@ -181,31 +234,57 @@
 #define DEADMAN_PIN                 GPIO_PIN_7
 #define DEADMAN_ACTIVE_LOW          1
 #define DEADMAN_RELEASE_DEBOUNCE_MS 20U            /* fast: release = stop      */
+/* DEADMAN_ARMS_ASSIST 1 (no assist buttons wired yet): PRESSING the handle
+ * switch arms the assist (AS 1 + friction / gravity comp, as the B1 / D8
+ * button did); RELEASING it ramps the wheels to 0 (DEADMAN_DECEL_REV_PER_S2)
+ * and, once stopped and held for DEADMAN_DISARM_HOLD_MS, disarms it (axes
+ * IDLE).  0 = original behaviour: the switch only gates an assist armed by
+ * a button / `AS 1`, and the wheels are held at 0 after a release. */
+#define DEADMAN_ARMS_ASSIST         1
+#define DEADMAN_DISARM_HOLD_MS      500U
+/* Handle gestures (deadman.c, payload.c, assist_control.c):
+ *   ONE CLICK (press <= DEADMAN_CLICK_MAX_MS, no 2nd click within
+ *           DEADMAN_CLICK_GAP_MS) -> accept the most recent settled load,
+ *           only while STANDING (PAYLOAD_ACCEPT_ON_HANDLE).
+ *   HOLD  = pressed >= DEADMAN_HOLD_MS  -> arms the assist (quick clicks never
+ *           arm the motors).  Release still stops at once.
+ *   TRIPLE CLICK = 3 presses each <= DEADMAN_CLICK_MAX_MS, gaps <=
+ *           DEADMAN_CLICK_GAP_MS -> manual load-detect zero, only when the IMU
+ *           says the trolley is at / near tipped back (where the zero is taken). */
+#define DEADMAN_HOLD_MS             400U
+#define DEADMAN_CLICK_MAX_MS        350U
+#define DEADMAN_CLICK_GAP_MS        500U
 #define DEADMAN_PRESS_DEBOUNCE_MS   80U            /* slower: no bounce re-arm  */
 
 /* =====================================================================
  *  Load detection — 2 x HX711 strain-gauge ADCs (loadcell.c)
- *  Ported from P102_LoadDetect_G491RE v4.2 (same pins as that rig).
- *    CH1 middle strip   (POISSON_HALF)  DT PA10 (D2)  SCK PB3 (D3)
- *    CH2 left + right   (POISSON_FULL)  DT PB5  (D4)  SCK PB4 (D5)
- *  Both HX711 VCC from 3V3 (logic matches the MCU), GND common.
+ *  Ported from P102_LoadDetect_G491RE v4.2.
+ *    CH1 middle strip   (POISSON_HALF)  DT PE11  SCK PE12
+ *    CH2 left + right   (POISSON_FULL)  DT PE13  SCK PE14
+ *  Both moved off the Nucleo pins (PA10/PB3, PB5/PB4) onto free DISC1
+ *  pins next to each other on the long header (PA10 is the micro-USB ID
+ *  line, PB3 the ST-Link SWO line).
+ *  Both HX711 VCC from 3V (DISC1 = 3.0 V; the HX711 runs from 2.6 V, the
+ *  bridge excitation is a little lower than on 3.3 V - recalibrate after
+ *  any supply change).  GND common.
  *  DT inputs have internal pull-ups so a loose wire reads NO_DATA.
- *  PB3 leaves JTAG (SWD on PA13/PA14 is unaffected).
- *  Status LED LD2 (PA5): solid = load valid, slow blink = settling / not
- *  calibrated / held / overload, fast blink = fault.
- *  Settings live in the LAST flash page (0x0807F800, 2 KB) — keep the
- *  firmware image well below 510 KB.
+ *  Status LED: DISC1 LD4 (green, PD12) - was LD2/PA5 on the Nucleo (PA5 is
+ *  the on-board accelerometer's SPI clock on the DISC1).  Solid = load
+ *  valid, slow blink = settling / not calibrated / held / overload, fast
+ *  blink = fault.
+ *  Settings live in flash sector 11 (0x080E0000, 128 KB) - keep the
+ *  firmware image below 896 KB.
  * =====================================================================*/
-#define LC_CH1_DT_PORT              GPIOA
-#define LC_CH1_DT_PIN               GPIO_PIN_10
-#define LC_CH1_SCK_PORT             GPIOB
-#define LC_CH1_SCK_PIN              GPIO_PIN_3
-#define LC_CH2_DT_PORT              GPIOB
-#define LC_CH2_DT_PIN               GPIO_PIN_5
-#define LC_CH2_SCK_PORT             GPIOB
-#define LC_CH2_SCK_PIN              GPIO_PIN_4
-#define LC_LED_PORT                 GPIOA
-#define LC_LED_PIN                  GPIO_PIN_5
+#define LC_CH1_DT_PORT              GPIOE
+#define LC_CH1_DT_PIN               GPIO_PIN_11
+#define LC_CH1_SCK_PORT             GPIOE
+#define LC_CH1_SCK_PIN              GPIO_PIN_12
+#define LC_CH2_DT_PORT              GPIOE
+#define LC_CH2_DT_PIN               GPIO_PIN_13
+#define LC_CH2_SCK_PORT             GPIOE
+#define LC_CH2_SCK_PIN              GPIO_PIN_14
+#define LC_LED_PORT                 GPIOD
+#define LC_LED_PIN                  GPIO_PIN_12
 
 /* LCD row 1, third field: 1 = handle switch state (PRESS / RELSD),
  * 0 = load-detect status (OK / NOCAL / NODAT / HELD ...). */
@@ -226,5 +305,22 @@
 #define DEBUG_UART_RX_PIN           GPIO_PIN_3
 #define DEBUG_UART_AF               GPIO_AF7_USART2
 #define DEBUG_UART_IRQn             USART2_IRQn
+
+/* =====================================================================
+ *  Optional parts on the F407 DISC1 bring-up
+ * =====================================================================*/
+/* IMU_ENABLE 1: ISM330DHCX on I2C1 drives the pose machine (STANDING /
+ * DRIVING), the observer slope and load-detection pose (accepting the load
+ * on the handle press needs it).  0 = never started or read even if wired:
+ * "dev mode", the handle switch alone gates the assist. */
+#ifndef IMU_ENABLE
+#define IMU_ENABLE                  1
+#endif
+
+/* UI_BUTTONS_ENABLE 0: the front-panel buttons (payload +/-, D8 assist
+ * toggle) are not wired on the DISC1 yet, and their Nucleo pins clash with
+ * DISC1 parts (PB6 has the audio chip's pull-up = reads "pressed").  Payload
+ * stays at its manual value (W <kg> / load detection). */
+#define UI_BUTTONS_ENABLE           0
 
 #endif /* BOARD_H */

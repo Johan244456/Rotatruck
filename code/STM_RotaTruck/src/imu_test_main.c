@@ -6,12 +6,7 @@
  *  ISM330DHCX on I2C1, scans the bus once, then prints one IMU line every
  *  100 ms (cart frame, same format as the main firmware's `I S` stream).
  *
- *  Output goes to BOTH:
- *    - RTT over the ST-Link (same mini-USB cable as flashing): run
- *      tools/rtt_monitor.sh.  Needed because the DISC1's ST-Link virtual
- *      COM port is NOT wired to the F407.
- *    - USART2 TX = PA2, RX = PA3, 115200 8N1, for a 3.3 V USB-serial
- *      adapter (adapter RX -> PA2, GND -> GND).
+ *  Output: RTT (PlatformIO serial monitor) + USART2 PA2 — see bringup_io.h.
  *
  *  Handle (dead-man) switch: PE7 -> switch -> GND (deadman.c, board.h).
  *  Shown as handle=PRESSED/RELEASED on every line, and each debounced
@@ -38,65 +33,15 @@
 #include "imu.h"
 #include "deadman.h"
 #include "odrive_can.h"
-#include "rtt.h"
-#include <stdio.h>
+#include "bringup_io.h"
 #include <math.h>
-#include <stdarg.h>
-#include <string.h>
+#include <stdio.h>
 
 #define STREAM_PERIOD_MS 100U
 
-static UART_HandleTypeDef huart_dbg;
 static bool s_can_ok = false;
 
-static void SystemClock_Config(void);
-
-/* ---------------------------------------------------------------------
- *  uart_print / uart_printf  (imu.c prints through these; the full
- *  firmware gets them from command.c, which is not in this build)
- * -------------------------------------------------------------------*/
-void uart_print(const char *s)
-{
-    size_t n = strlen(s);
-    rttWrite(s, n);
-    HAL_UART_Transmit(&huart_dbg, (uint8_t *)s, (uint16_t)n, 100);
-}
-
-void uart_printf(const char *fmt, ...)
-{
-    char buf[192];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    if (n <= 0) return;
-    if (n >= (int)sizeof buf) n = (int)sizeof buf - 1;
-    rttWrite(buf, (size_t)n);
-    HAL_UART_Transmit(&huart_dbg, (uint8_t *)buf, (uint16_t)n, 100);
-}
-
-static void uart_init(void)
-{
-    huart_dbg.Instance          = DEBUG_UART_INSTANCE;
-    huart_dbg.Init.BaudRate     = DEBUG_UART_BAUD;
-    huart_dbg.Init.WordLength   = UART_WORDLENGTH_8B;
-    huart_dbg.Init.StopBits     = UART_STOPBITS_1;
-    huart_dbg.Init.Parity       = UART_PARITY_NONE;
-    huart_dbg.Init.Mode         = UART_MODE_TX_RX;
-    huart_dbg.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
-    huart_dbg.Init.OverSampling = UART_OVERSAMPLING_16;
-    HAL_UART_Init(&huart_dbg);
-}
-
-/* Non-blocking single-key read: RTT terminal first, then USART2 (polled). */
-static int key_getc(void)
-{
-    int c = rttGetc();
-    if (c >= 0) return c;
-    if (__HAL_UART_GET_FLAG(&huart_dbg, UART_FLAG_ORE)) __HAL_UART_CLEAR_OREFLAG(&huart_dbg);
-    if (!__HAL_UART_GET_FLAG(&huart_dbg, UART_FLAG_RXNE)) return -1;
-    return (int)(huart_dbg.Instance->DR & 0xFFU);
-}
+void SystemClock_Config(void);   /* clock_f4.c */
 
 /* ---------------------------------------------------------------------
  *  ODrive CAN (listen-only use of odrive_can.c)
@@ -220,8 +165,7 @@ int main(void)
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    rttInit();
-    uart_init();
+    bringupIoInit();
     uart_print("\r\n=== RotaTruck F407 IMU test ===\r\n");
 
     if (imuBegin()) {
@@ -240,7 +184,7 @@ int main(void)
     while (1) {
         deadmanPoll();
         can_poll();
-        switch (key_getc()) {
+        switch (bringupGetc()) {
         case ' ': streaming = !streaming;
                   uart_print(streaming ? "-- resumed --\r\n" : "-- paused --\r\n"); break;
         case 's': imuScanBus(); break;
@@ -257,98 +201,8 @@ int main(void)
     }
 }
 
-/* ---------------------------------------------------------------------
- *  168 MHz from the 8 MHz HSE crystal (X2 on the DISC1):
- *  8 / M8 * N336 / P2 = 168 MHz SYSCLK, Q7 = 48 MHz (USB).
- *  APB1 = 42 MHz (I2C1, USART2), APB2 = 84 MHz.
- * -------------------------------------------------------------------*/
-static void SystemClock_Config(void)
-{
-    __HAL_RCC_PWR_CLK_ENABLE();
-    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
-
-    RCC_OscInitTypeDef o = {0};
-    o.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-    o.HSEState       = RCC_HSE_ON;
-    o.PLL.PLLState   = RCC_PLL_ON;
-    o.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
-    o.PLL.PLLM       = 8;
-    o.PLL.PLLN       = 336;
-    o.PLL.PLLP       = RCC_PLLP_DIV2;
-    o.PLL.PLLQ       = 7;
-    if (HAL_RCC_OscConfig(&o) != HAL_OK) { while (1) { } }
-
-    RCC_ClkInitTypeDef c = {0};
-    c.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
-                     | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-    c.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
-    c.AHBCLKDivider  = RCC_SYSCLK_DIV1;
-    c.APB1CLKDivider = RCC_HCLK_DIV4;
-    c.APB2CLKDivider = RCC_HCLK_DIV2;
-    if (HAL_RCC_ClockConfig(&c, FLASH_LATENCY_5) != HAL_OK) { while (1) { } }
-}
-
-/* ---------------------------------------------------------------------
- *  HAL MSP + interrupt glue (F4)
- * -------------------------------------------------------------------*/
-void HAL_MspInit(void)
-{
-    __HAL_RCC_SYSCFG_CLK_ENABLE();
-    __HAL_RCC_PWR_CLK_ENABLE();
-}
-
-void HAL_I2C_MspInit(I2C_HandleTypeDef *hi2c)
-{
-    if (hi2c->Instance != IMU_I2C_INSTANCE) return;
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-
-    GPIO_InitTypeDef g = {0};
-    g.Mode      = GPIO_MODE_AF_OD;
-    g.Pull      = GPIO_PULLUP;
-    g.Speed     = GPIO_SPEED_FREQ_HIGH;
-    g.Alternate = IMU_I2C_GPIO_AF;
-    g.Pin = IMU_I2C_SCL_PIN; HAL_GPIO_Init(IMU_I2C_SCL_PORT, &g);
-    g.Pin = IMU_I2C_SDA_PIN; HAL_GPIO_Init(IMU_I2C_SDA_PORT, &g);
-
-    /* Enable the clock only after the pins are on AF, then pulse the
-     * peripheral reset - avoids the F4 I2C "BUSY stuck after init" erratum. */
-    __HAL_RCC_I2C1_CLK_ENABLE();
-    __HAL_RCC_I2C1_FORCE_RESET();
-    __HAL_RCC_I2C1_RELEASE_RESET();
-}
-
-void HAL_I2C_MspDeInit(I2C_HandleTypeDef *hi2c)
-{
-    if (hi2c->Instance != IMU_I2C_INSTANCE) return;
-    __HAL_RCC_I2C1_CLK_DISABLE();
-}
-
-void HAL_UART_MspInit(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance != DEBUG_UART_INSTANCE) return;
-    __HAL_RCC_USART2_CLK_ENABLE();
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-
-    GPIO_InitTypeDef g = {0};
-    g.Mode      = GPIO_MODE_AF_PP;
-    g.Pull      = GPIO_PULLUP;
-    g.Speed     = GPIO_SPEED_FREQ_HIGH;
-    g.Alternate = DEBUG_UART_AF;
-    g.Pin = DEBUG_UART_TX_PIN; HAL_GPIO_Init(DEBUG_UART_TX_PORT, &g);
-    g.Pin = DEBUG_UART_RX_PIN; HAL_GPIO_Init(DEBUG_UART_RX_PORT, &g);
-}
-
-void SysTick_Handler(void)
-{
-    HAL_IncTick();
-}
-
+/* CAN2 RX FIFO 0 -> ODrive heartbeats (SysTick/HardFault: bringup_io.c). */
 void CAN2_RX0_IRQHandler(void)
 {
     odriveCanRxISR();
-}
-
-void HardFault_Handler(void)
-{
-    while (1) { }
 }

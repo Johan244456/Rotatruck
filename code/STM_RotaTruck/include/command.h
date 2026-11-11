@@ -15,7 +15,7 @@ void commandSetup(void);
 void commandPoll(void);
 
 /* USART2 interrupt handler — call from USART2_IRQHandler in
- * stm32g4xx_it.c. */
+ * stm32f4xx_it.c. */
 void commandUartISR(void);
 
 /* Convenience print helpers used by motor_control.c (and elsewhere). */

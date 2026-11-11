@@ -29,7 +29,7 @@
 #include "admittance.h"
 #include "motor_control.h"
 #include "command.h"
-#include "stm32g4xx_hal.h"
+#include "stm32f4xx_hal.h"
 
 static RunMode   s_mode      = RUN_MODE_MANUAL;
 static TruckPose s_last_pose = POSE_STANDING;
