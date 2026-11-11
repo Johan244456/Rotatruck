@@ -1,0 +1,19 @@
+{
+  "counts_per_newton": -18019.076001148882,
+  "saved": "2026-11-09T17:55:42",
+  "source": "test_12_20261109_175212.csv",
+  "unit": "N",
+  "input_unit": "g",
+  "points": [
+    {
+      "known": 15000.0,
+      "counts": 98515.6,
+      "method": "pair"
+    },
+    {
+      "known": 30000.0,
+      "counts": -2552085.975,
+      "method": "single"
+    }
+  ]
+}

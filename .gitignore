@@ -1,0 +1,18 @@
+# Build output / editor
+.pio/
+.vscode/
+.claude/
+__pycache__/
+*.pyc
+
+# Heavy documentation (kept locally, not in git)
+docs/
+*.pdf
+*.docx
+*.doc
+*.pptx
+*.xlsx
+*.fig
+
+# Archives (duplicates of tracked folders)
+*.zip
