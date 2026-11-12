@@ -64,8 +64,10 @@ int main(void)
 
     /* Status LCD — non-blocking, serviced from the main loop. */
     uart_print(displayInit()
-               ? "LCD: 16x2 I2C display detected.\r\n"
-               : "LCD: not detected (check I2C address/wiring on PB9/PB8).\r\n");
+               ? (LCD_I2C_SEPARATE_BUS ? "LCD: 16x2 I2C display detected (own bus I2C3, SCL PA8 / SDA PC9).\r\n"
+                                       : "LCD: 16x2 I2C display detected (I2C1, shared with the IMU).\r\n")
+               : (LCD_I2C_SEPARATE_BUS ? "LCD: not detected (own bus I2C3: SCL PA8, SDA PC9, VCC 5V, GND; address 0x27/0x3F).\r\n"
+                                       : "LCD: not detected (check I2C address/wiring on PB9/PB8).\r\n"));
 
     /* Handle (dead-man) safety switch on PE7 - before the pose machine, which
      * ramps the wheels to a stop whenever it reads released. */

@@ -10,14 +10,10 @@ extern "C" {
 /* =====================================================================
  *  display.h — the operator status screen, a first-class system module.
  *
- *  Renders live system state to the 16x2 LCD:
- *    Row 0:  ASSIST:<ON|OFF> ........ <assist payload kg: latched from load
- *            detection, or 'M' suffix = manual / buttons; ERR if a motor fault>
- *    Row 1:  <STAND|DRIVE> <FWD|BACK|HOLD|IDLE|STOP> <third field>
- *            third field = handle switch PRESS / RELSD (LCD_ROW1_SHOW_HANDLE 1)
- *            or load status OK SETL NOCAL RAIL FROZ NODAT IMPL OVER HELD IMU!
- *            ("LD CONSOLE <load status>" in the LD console)
- *    Row 1:  <STAND|DRIVE> .......... <IDLE|FWD|BACK|HOLD>
+ *  Renders live system state to the 16x2 LCD (layout details in display.c):
+ *    Line 1:  <UPRIGHT|DRIVE> <live scale kg (actual value also when out of range), or a fault code>
+ *    Line 2:  <AUTO|MAN> <kg the assist uses: AUTO 0.7 x, MAN 1.0 x load> <ON|OFF|ERR>
+ *             ("LD CONSOLE <load status>" in the LD console)
  *
  *  displayUpdate() is called every main-loop pass; it samples the other
  *  subsystems (pose / admittance / observer / odrive) and drives

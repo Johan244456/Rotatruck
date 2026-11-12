@@ -1,45 +1,38 @@
 /*
- *  display.c — operator status screen.
+ *  display.c — operator status screen (16x2 LCD).
  *
- *  Pulls live state from the rest of the system and pushes it to the
- *  non-blocking LCD.  Building the lines is cheap (a few getters + two
- *  snprintf); lcdSetLines() only flags a repaint when the text actually
- *  changes, and lcdService() spreads that repaint over many loop passes.
+ *    line 1:  <position> <live scale reading>      e.g. "UPRIGHT  30.2kg"
+ *    line 2:  <AUTO|MAN> <assist kg> <ON|OFF|ERR>  e.g. "AUTO  21.0kg ON"
+ *
+ *  Position (the motor pose machine, assist_control.c):
+ *    DRIVE    fully tipped back (within POSE_DRIVE_FULL_ENTER_DEG of `q r`):
+ *             the assist may drive the wheels
+ *    UPRIGHT  everything else (upright, partly tipped, or no IMU): wheels held
+ *  Scale reading: "30.2kg" settled, "~30.2kg" not settled / not weighing
+ *  (moving, tipped back), "!" over the rated load; out of the plausible range
+ *  shows the actual value ("-12.1kg", "2480kg") instead of IMPL; the other
+ *  faults show their code (NOCAL RAIL FROZ NODAT IMU!).
+ *  Line 2: the weight the assist is sized for (AUTO: LOAD_ASSIST_SCALE 0.7 x the
+ *  measured load; MAN: MANUAL_ASSIST_SCALE 1.0 x the typed / default load),
+ *  AUTO = from the scale (read upright / handle click), MAN = power-up default
+ *  or `W <kg>`; then the assist ON / OFF, or ERR if an ODrive reports a fault.
+ *  In the LD console line 2 reads "LD CONSOLE <status>".
+ *
+ *  Building the lines is cheap; lcdSetLines() only flags a repaint when the
+ *  text changes, and lcdService() spreads the repaint over many loop passes.
  */
 
 #include "display.h"
 #include "lcd_i2c.h"
 #include "assist_control.h"
 #include "admittance.h"
-#include "observer.h"
 #include "odrive_can.h"
 #include "loadcell.h"
 #include "payload.h"
-#include "deadman.h"
 #include "board.h"
 
 #include <stdio.h>
 #include <string.h>
-
-static const char *pose_short(void)
-{
-    return (assistGetPose() == POSE_DRIVE) ? "DRIVE" : "STAND";
-}
-
-/* Map the admittance state *name* to a short LCD label. Kept as string
- * compares to avoid pulling in the admittance enum - if those names change,
- * update here. BRAKING is shown as HOLD on purpose. */
-static const char *assist_short(void)
-{
-    /* Handle switch released with the assist on: ramping down / held. */
-    if (admittanceIsEnabled() && !deadmanPressed()) return "STOP";
-    const char *s = admittanceStateName();
-    if (strcmp(s, "ASSIST FWD")  == 0) return "FWD";
-    if (strcmp(s, "ASSIST BACK") == 0) return "BACK";
-    if (strcmp(s, "HOLD")        == 0) return "HOLD";
-    if (strcmp(s, "BRAKING")     == 0) return "HOLD";
-    return "IDLE";   /* IDLE / OFF / CAL */
-}
 
 /* ERROR if either ODrive reports a non-zero axis error word. */
 static bool motor_error_present(void)
@@ -51,20 +44,32 @@ static bool motor_error_present(void)
     return false;
 }
 
-/* Top-right: the payload the assist is using (latched from load detection,
- * or 'M' suffix = manual / buttons), unless a motor fault overwrites it
- * with ERR. */
-static void right_field(char *out, size_t n)
+/* Position, <= 7 chars: the motor pose machine's two states. */
+static void position_text(char *out, size_t n)
 {
-    if (motor_error_present()) {
-        snprintf(out, n, "ERR");
-        return;
+    snprintf(out, n, (assistGetPose() == POSE_DRIVE) ? "DRIVE" : "UPRIGHT");
+}
+
+/* Live scale reading, <= 8 chars: "30.2kg" settled, "~30.2kg" not settled /
+ * not weighing, "!160kg" over the rated load.  Out of the plausible range
+ * (IMPLAUSIBLE) shows the actual value anyway ("-12.1kg", "2480kg") instead of
+ * IMPL; the other faults keep their code (NOCAL RAIL FROZ NODAT IMU!). */
+static void scale_text(char *out, size_t n)
+{
+    char flag;
+    switch (loadcellStatus()) {
+    case LC_ST_OK:
+    case LC_ST_IMPLAUSIBLE: flag = ' '; break;          /* actual value, no IMPL code */
+    case LC_ST_SETTLING:
+    case LC_ST_HELD:        flag = '~'; break;
+    case LC_ST_OVERLOAD:    flag = '!'; break;
+    default:                snprintf(out, n, "%s", loadcellStatusShort()); return;   /* fault code */
     }
-    bool manual = payloadIsManual();
-    int kg = (int)(payloadGetLoadKg() + 0.5f);    /* the load the operator set / accepted */
-    if (kg < 0)   kg = 0;
-    if (kg > 999) kg = 999;
-    snprintf(out, n, manual ? "%dkgM" : "%dkg", kg);
+    float kg = loadcellMeasuredKg();
+    if (kg >  9999.0f) kg =  9999.0f;
+    if (kg < -999.0f)  kg = -999.0f;
+    if (kg > -9.95f && kg < 99.95f) snprintf(out, n, "%c%.1fkg", flag, (double)kg);
+    else                            snprintf(out, n, "%c%.0fkg", flag, (double)kg);
 }
 
 bool displayInit(void)
@@ -78,28 +83,23 @@ void displayUpdate(void)
 {
     if (!lcdIsPresent()) return;
 
-    /* Row 0: ASSIST:<ON|OFF>  <payload kg | ERR>
-     * Row 1: <pose> <assist state> <load-detect status>
-     *        e.g. "DRIVE FWD  HELD " / "STAND HOLD OK   " / "STAND IDLE NOCAL"
-     *        In the LD console: "LD CONSOLE <status>" */
-    char line0[17], line1[17], right[8];
-    right_field(right, sizeof right);
-    snprintf(line0, sizeof line0, "ASSIST:%-3s%6s",
-             admittanceIsEnabled() ? "ON" : "OFF", right);
+    char pos[10], scale[12], line0[24], line1[24];
+    position_text(pos, sizeof pos);
+    scale_text(scale, sizeof scale);
+    snprintf(line0, sizeof line0, "%-7s %8s", pos, scale);
+
     if (loadcellConsoleActive()) {
         snprintf(line1, sizeof line1, "LD CONSOLE %-5s", loadcellStatusShort());
     } else {
-#if LCD_ROW1_SHOW_HANDLE
-        /* Third field = handle (dead-man) switch: PRESS / RELSD. */
-        snprintf(line1, sizeof line1, "%-5s %-4s %-5s", pose_short(), assist_short(),
-                 deadmanPressed() ? "PRESS" : "RELSD");
-#else
-        /* Third field = load-detect status (OK, NOCAL, NODAT, HELD ...). */
-        snprintf(line1, sizeof line1, "%-5s %-4s %-5s", pose_short(), assist_short(),
-                 loadcellStatusShort());
-#endif
+        float kg = payloadGetKg();                    /* what the assist is sized for */
+        if (kg < 0.0f)   kg = 0.0f;
+        if (kg > 999.0f) kg = 999.0f;
+        const char *state = motor_error_present() ? "ERR"
+                          : admittanceIsEnabled() ? "ON" : "OFF";
+        snprintf(line1, sizeof line1, "%-4s %5.1fkg %-3s",
+                 payloadIsManual() ? "MAN" : "AUTO", (double)kg, state);
     }
 
-    lcdSetLines(line0, line1);   /* cheap: flags a repaint only on change */
+    lcdSetLines(line0, line1);   /* pads / truncates to 16; repaints only on change */
     lcdService();                /* push one byte of the repaint, if any  */
 }

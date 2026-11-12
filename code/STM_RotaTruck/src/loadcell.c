@@ -398,6 +398,21 @@ static int finite3(const float *v) {
          (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) > 0.25f;
 }
 
+/* [F4] FINAL calibration lock (board.h LC_FINAL_*): overrides the flash
+ * settings at every power-up, so the load always uses the final bench fit. */
+static void apply_final_cal(void) {
+#if LC_FINAL_CAL_LOCK
+  const uint32_t v = LC_FINAL_VIEW;
+  cfg.view        = v;
+  cfg.cpn[v]      = LC_FINAL_COUNTS_PER_N;
+  cfg.coff[v]     = LC_FINAL_OFFSET_COUNTS;
+  cfg.calValid[v] = 1;
+  cfg.sign1       = LC_FINAL_SIGN_CH1;
+  cfg.zero1       = (int32_t)LC_FINAL_ZERO_CH1;
+  cfg.zeroValid  |= 1U;
+#endif
+}
+
 /* returns 0 = defaults, 1 = loaded, 2 = migrated from v4.1 (v5) */
 static int store_load(void) {
   store_t s;
@@ -458,6 +473,13 @@ static int   primary_ch(void) { return (!dualStream && cfg.view == 2) ? 1 : 0; }
 static float ref_cpu(void)    { return ch[primary_ch()].cpu; }
 static const char *view_cfg(void) { return primary_ch() == 1 ? "POISSON_FULL" : "POISSON_HALF"; }
 static int   zero_ok(int i)   { return (cfg.zeroValid >> i) & 1U; }
+/* [F4] an in-view HX711 at (or near) full scale / not answering: its reading
+ * is meaningless, so no zero may be taken from it (it would zero onto the rail). */
+static int   any_railed(void) {
+  for (int i = 0; i < 2; i++)
+    if (in_view(i) && (labs(ch[i].raw) > HX_RAIL_WARN || ch[i].raw == -1)) return 1;
+  return 0;
+}
 
 /* ------------------------------------------------------------------ constants */
 static int valid_r(float r) { return r == r && r >= 50.0f && r <= 10000.0f; }
@@ -736,6 +758,11 @@ static void run_diagnostic(void) {
  * skipped after 250 ms instead of 1 s per sample. */
 static void do_tare_n(int save, int n) {
   int done = 0;
+  if (any_railed()) {
+    out("# REFUSED: HX711 at full scale (raw %ld) - a bridge wire / joint is open; fix it before zeroing\r\n",
+        (long)ch[0].raw);
+    return;
+  }
   if (gating() && imuOk && pose != LP_UNKNOWN && pose != LP_TIPPED_STILL)
     out("# [WARN] zeroing while %s. The zero should be taken tipped back, empty, hands off.\r\n",
         POSE_NAME[pose]);
@@ -1126,7 +1153,7 @@ static void rest_zero_row(void) {
   for (int i = 0; i < 2; i++) ztHist[i][ztIdx] = ch[i].med;
   ztIdx = (uint8_t)((ztIdx + 1) % ZT_HIST);
   if (ztCount < ZT_HIST) ztCount++;
-  int rowStill = gating() && imuOk && pose == LP_TIPPED_STILL && !movedSinceRow;
+  int rowStill = gating() && imuOk && pose == LP_TIPPED_STILL && !movedSinceRow && !any_railed();
   movedSinceRow = 0;
   if (!rowStill) { ztRun = 0; ztInBandMs = 0; rest_zero_end(); return; }
   if (ztRun < 0xFFFFU) ztRun++;
@@ -1179,6 +1206,31 @@ static void handle_command(char *cmd) {
   float arg = strtof(args, NULL);
   char c0 = cmd[0];
   if (c0 >= 'A' && c0 <= 'Z') c0 = (char)(c0 + 32);
+#if LC_FINAL_CAL_LOCK
+  /* FINAL calibration locked: commands that would change it are refused.
+   * `s` with the FINAL values themselves (as the dashboard sends) is a no-op. */
+  if (c0 == 'x' || c0 == 'c' || c0 == 's' || c0 == 'u' || c0 == 'i') {
+    if (c0 == 's') {
+      char *e1, *e2;
+      float sl = strtof(args, &e1), of = strtof(e1, &e2);
+      if (e1 != args && e2 != e1 &&
+          fabsf(sl - LC_FINAL_COUNTS_PER_N) < 0.001f * LC_FINAL_COUNTS_PER_N &&
+          fabsf(of - LC_FINAL_OFFSET_COUNTS) < 1.0f) {
+        out("# scale = FINAL calibration already (%.4f counts/N, offset %.1f) - unchanged\r\n",
+            (double)LC_FINAL_COUNTS_PER_N, (double)LC_FINAL_OFFSET_COUNTS);
+        return;
+      }
+    } else if (c0 == 'x' && strtol(args, NULL, 10) == LC_FINAL_VIEW) {
+      out("# view x %d = FINAL calibration view already - unchanged\r\n", LC_FINAL_VIEW);
+      return;
+    }
+    out("# REFUSED: the FINAL calibration is locked (board.h LC_FINAL_CAL_LOCK 1): "
+        "view x %d, s %.4f %.1f, zero %ld.  Set LC_FINAL_CAL_LOCK 0 to re-calibrate.\r\n",
+        LC_FINAL_VIEW, (double)LC_FINAL_COUNTS_PER_N, (double)LC_FINAL_OFFSET_COUNTS,
+        (long)LC_FINAL_ZERO_CH1);
+    return;
+  }
+#endif
   switch (c0) {
     case 'd': run_diagnostic(); break;
     case 'b': print_banner(); bridge_report(); break;
@@ -1305,7 +1357,7 @@ static void update_led(void) {
 /* Auto-zero: a stable reading close to zero for 3 s becomes the new zero.
  * Band in kg ('a'). Only runs once the current view is calibrated. */
 static void auto_zero(float *offset) {
-  if (!(AZT_BAND_KG > 0 && !repActive && cfg.calValid[cfg.view])) { aztSinceMs = 0; return; }
+  if (!(AZT_BAND_KG > 0 && !repActive && cfg.calValid[cfg.view]) || any_railed()) { aztSinceMs = 0; return; }
   int stable = FILTER_MODE ? shHolding : 1;
   float kg = counts_to_kg(*offset);
   int inBand = fabsf(kg) < AZT_BAND_KG && fabsf(kg) > AZT_DEADZONE_KG;
@@ -1371,6 +1423,7 @@ static int check_no_data(void) {
 void loadcellInit(void) {
   pins_init();
   int loaded = store_load();
+  apply_final_cal();                             /* [F4] FINAL calibration always wins */
   compute_constants();
   pose_refs();
 
@@ -1390,6 +1443,11 @@ void loadcellInit(void) {
               present[0] ? "ok" : "MISSING", present[1] ? "ok" : "MISSING",
               (zero_ok(0) && zero_ok(1)) ? "saved" : "power-up tare",
               (unsigned long)cfg.view, gating() ? "ON" : "OFF");
+#if LC_FINAL_CAL_LOCK
+  uart_printf("LOAD: FINAL calibration locked: view x %d, s %.4f %.1f, zero %ld, gain %d "
+              "(board.h LC_FINAL_*)\r\n", LC_FINAL_VIEW, (double)LC_FINAL_COUNTS_PER_N,
+              (double)LC_FINAL_OFFSET_COUNTS, (long)LC_FINAL_ZERO_CH1, HX_GAIN);
+#endif
   if (!loaded) uart_print("LOAD: no saved load-detect settings in flash - defaults\r\n");
   if (loaded == 2) uart_print("LOAD: settings migrated from v4.1 layout\r\n");
   if (!cfg.calValid[cfg.view])
@@ -1476,6 +1534,11 @@ const char *loadcellPoseName(void) { return imuOk ? POSE_NAME[pose] : "NO IMU"; 
  * the plate is empty.  Returns false (with the reason printed) if refused. */
 bool loadcellZeroFromHandle(uint32_t first_press_ms)
 {
+  if (any_railed()) {
+    out_evt("# LOAD: handle zero refused - HX711 at full scale (raw %ld): bridge wire / joint open, "
+            "fix the wiring first\r\n", (long)ch[0].raw);
+    return false;
+  }
   if (!imuOk) {
     out_evt("# LOAD: handle zero refused - no IMU, can't confirm the trolley is tipped back\r\n");
     return false;

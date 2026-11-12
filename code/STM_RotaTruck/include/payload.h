@@ -45,7 +45,8 @@ void  payloadInit(void);
 void  payloadUpdate(void);
 
 /* Payload the assist is using now, and whether it is the manual value. */
-float payloadGetKg(void);          /* ASSIST payload = LOAD_ASSIST_SCALE x initialised load */
+float payloadGetKg(void);          /* ASSIST payload = payloadAssistScale() x initialised load */
+float payloadAssistScale(void);    /* AUTO (measured) 0.7 = LOAD_ASSIST_SCALE, MANUAL 1.0 = MANUAL_ASSIST_SCALE */
 float payloadGetLoadKg(void);      /* the initialised load (accepted / default / W / buttons) */
 bool  payloadIsManual(void);
 

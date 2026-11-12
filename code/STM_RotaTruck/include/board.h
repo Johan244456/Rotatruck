@@ -24,7 +24,7 @@
  *
  *  Sensors / UI:
  *    ISM330DHCX IMU : I2C1 on PB8/PB9 (D14/D15), 0x6B
- *    16x2 LCD       : same I2C1 bus via PCF8574 backpack
+ *    16x2 LCD       : own bus I2C3, SCL PA8 / SDA PC9, via PCF8574 backpack (5V)
  *    2 x HX711      : PE11/PE12 (CH1), PE13/PE14 (CH2) - load detection, LED PD12
  *    Button         : PA9 (assist toggle), active-high with pull-down
  *
@@ -139,9 +139,10 @@
  *
  *  LCD: common 16x2 HD44780 display with a PCF8574 I2C backpack.  Most
  *  backpacks are either 0x27 or 0x3F; the firmware probes both.
- *  It shares I2C1 with the ISM330DHCX, so wire SDA/SCL in parallel.  Check
- *  the backpack's SDA/SCL pull-ups: if they go to 5 V they over-drive the
- *  3.3 V-only ISM330DHCX - remove them or power the backpack from 3V3.
+ *  It has its OWN bus (I2C3, PA8/PC9 - LCD_I2C_SEPARATE_BUS below), so the
+ *  backpack runs from 5V with its 5 V pull-ups and never touches the
+ *  3.3 V-only ISM330DHCX on I2C1.  (With LCD_I2C_SEPARATE_BUS 0 it shares
+ *  I2C1 - then its pull-ups must NOT go to 5 V.)
  *
  *  Front-panel buttons: POLLED with a per-button debounce state machine
  *  (mode_input.c) — not interrupt-driven.  Edges are noisy on long wiring
@@ -165,10 +166,10 @@
 #define UI_MODE_BUTTON_DEBOUNCE_MS  40U            /* level-stable time to commit */
 #define UI_PAYLOAD_STEP_KG          5.0f           /* +/- per button press */
 #define UI_PAYLOAD_MAX_KG           250.0f         /* clamp ceiling */
-/* Initialised LOAD at power-up (kg): used until a load is accepted with the
- * handle or set with the +/- buttons / `W <kg>`.  The assist always gets
- * LOAD_ASSIST_SCALE x the initialised load (15 kg -> 10.5 kg).  The original
- * default was 0. */
+/* Initialised LOAD at power-up (kg): used until a load is read / accepted
+ * with the handle or set with `W <kg>`.  It is a MANUAL value, so the assist
+ * gets MANUAL_ASSIST_SCALE x it (1.0: 15 kg -> 15 kg).  The original default
+ * was 0. */
 #define PAYLOAD_DEFAULT_KG          15.0f
 
 /* Fraction of the MEASURED load handed to the assist (observer mass): the
@@ -176,6 +177,12 @@
  * deliberately under-sized.  Was 0.9; 0.7 for the DISC1 trials.  Used by
  * load detection (loadcell.c) and the accepted payload (payload.c). */
 #define LOAD_ASSIST_SCALE           0.7f
+
+/* Fraction of a MANUAL load (power-up default, `W <kg>`, +/- buttons) handed
+ * to the assist.  1.0 = the assist is sized for exactly the weight typed in:
+ * the operator states the load, so no measurement margin is applied.  The
+ * measured (AUTO) load keeps LOAD_ASSIST_SCALE. */
+#define MANUAL_ASSIST_SCALE         1.0f
 
 /* Accept the load with the HANDLE SWITCH: one click, while the IMU says the
  * trolley is at the standing angle (within 5 deg of the captured `q s`
@@ -200,6 +207,14 @@
  * (One click still accepts manually.)  0 = click only. */
 #define PAYLOAD_AUTO_ACCEPT         1
 #define PAYLOAD_AUTO_MIN_CHANGE_KG  0.5f
+/* Auto-read safety (2026-11-12, after a wiring fault was auto-accepted as
+ * 160 kg): the auto-read needs the reading to hold within +/-PAYLOAD_AUTO_STABLE_KG
+ * for PAYLOAD_AUTO_STABLE_MS while exactly upright.  A handle click takes the most
+ * recent valid upright reading, as before.  No upper weight limit.
+ * A manual `W <kg>` pauses the auto-read until `W A`, a handle click or a
+ * restart, so the operator can always override a bad scale. */
+#define PAYLOAD_AUTO_STABLE_MS      1500U
+#define PAYLOAD_AUTO_STABLE_KG      0.5f
 
 /* One pose definition for the whole system: the motor pose machine
  * (assist_control.c: STANDING = wheels held, DRIVING = assist) uses the SAME
@@ -275,6 +290,21 @@
  *  Settings live in flash sector 11 (0x080E0000, 128 KB) - keep the
  *  firmware image below 896 KB.
  * =====================================================================*/
+/* FINAL load calibration, LOCKED in firmware (host/stm_calibration_middle_FINAL.json,
+ * bench 2026-11-11, HX711 gain 64, middle strip CH1 = view x 1, R^2 0.989).
+ * With LC_FINAL_CAL_LOCK 1 these are applied at EVERY power-up, whatever is in
+ * the flash settings (erased, old, or changed with s / c / u / x / i), and the
+ * LD-console commands that would change them are refused.  The power-up zero
+ * is the recorded zero; the handle triple-click / rest zero / `t` still re-zero
+ * in RAM (drift), and the next power-up starts from the recorded zero again.
+ * 0 = calibration from the flash settings only (re-calibrating on the truck). */
+#define LC_FINAL_CAL_LOCK           1
+#define LC_FINAL_VIEW               1             /* x 1: CH1 middle strip, 2 gauges */
+#define LC_FINAL_COUNTS_PER_N       220.3704f     /* s <slope> ...                   */
+#define LC_FINAL_OFFSET_COUNTS      (-2086.4f)    /* s ... <offset>                  */
+#define LC_FINAL_ZERO_CH1           (-3028324L)   /* z -3028324 0 (recorded zero)    */
+#define LC_FINAL_SIGN_CH1           (-1)          /* CH1 sign used for the fit       */
+
 #define LC_CH1_DT_PORT              GPIOE
 #define LC_CH1_DT_PIN               GPIO_PIN_11
 #define LC_CH1_SCK_PORT             GPIOE
@@ -286,9 +316,23 @@
 #define LC_LED_PORT                 GPIOD
 #define LC_LED_PIN                  GPIO_PIN_12
 
-/* LCD row 1, third field: 1 = handle switch state (PRESS / RELSD),
- * 0 = load-detect status (OK / NOCAL / NODAT / HELD ...). */
-#define LCD_ROW1_SHOW_HANDLE        1
+/* LCD layout (display.c): line 1 = position + live scale reading,
+ * line 2 = AUTO/MAN + the weight the assist uses (AUTO 0.7 x, MAN 1.0 x) + assist ON/OFF/ERR. */
+
+/* LCD on its OWN I2C bus: I2C3, SCL = PA8, SDA = PC9 (both free on the DISC1
+ * and 5 V tolerant).  So the backpack can run from 5V with its own 5 V pull-ups
+ * (no level shifter) without touching the 3.3 V-only IMU on I2C1.  The pins
+ * have NO internal pull-up (an FT pin must not have it on above VDD) - the
+ * backpack's pull-ups are needed (most PCF8574 boards have 4.7k fitted).
+ * LCD_I2C_SEPARATE_BUS 0 = old wiring: LCD shares I2C1 (PB8/PB9) with the IMU. */
+#define LCD_I2C_SEPARATE_BUS        1
+#define LCD_I2C_INSTANCE            I2C3
+#define LCD_I2C_SCL_PORT            GPIOA
+#define LCD_I2C_SCL_PIN             GPIO_PIN_8
+#define LCD_I2C_SDA_PORT            GPIOC
+#define LCD_I2C_SDA_PIN             GPIO_PIN_9
+#define LCD_I2C_GPIO_AF             GPIO_AF4_I2C3
+#define LCD_I2C_CLOCK_HZ            100000U
 
 #define LCD_I2C_ADDR_PRIMARY        0x27u
 #define LCD_I2C_ADDR_FALLBACK       0x3Fu

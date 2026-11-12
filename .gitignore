@@ -16,3 +16,7 @@ docs/
 
 # Archives (duplicates of tracked folders)
 *.zip
+
+# Exception: the F407 user manual / technical document sources (Markdown) are
+# tracked; their generated .pdf / .docx copies stay local (rules above).
+!/code/STM_RotaTruck/docs/

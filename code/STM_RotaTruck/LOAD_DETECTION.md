@@ -1,188 +1,228 @@
-# Load detection in the RotaTruck firmware
+# Load detection in the RotaTruck firmware (STM32F407 DISC1)
 
-Automatic payload detection (spec FR5) from the P102 bench rig (`Code_STM/P102_LoadDetect_Main`, firmware v4.2) now runs inside the RotaTruck motor firmware. The detected load is latched into the assist when the truck is tipped back, and the +5 / -5 kg buttons stay as a manual fallback.
+The trolley weighs its load with strain gauges on the toe plate, read by an HX711. The load is read while the trolley stands upright, frozen when it tips back, and handed to the power assist. This note covers how it works, how to wire, zero and calibrate it, and what the faults look like.
 
-**Status (10 Nov 2026):** builds with no warnings (`-Wall -Wextra`), about 89 KB flash. **It has not been run on the truck yet.** Everything below the "Bring-up" heading is the plan, not verified results.
+**Status (12 Nov 2026):**
 
-## What changed
+- Runs in the full firmware on the DISC1, on the trolley.
+- Only the **middle strip** (2 gauges, HX711 CH1) is fitted and used.
+- The final bench calibration is **locked in the firmware**.
+- With the plate seated and zeroed, 15 kg read about 15 kg and 30 kg read 29–33 kg.
+- Open issues:
+    - The bridge drifts by a few kg per minute.
+    - The bridge shifts on the first load after a rest.
+    - Several push-on wires come loose (see [Known limits](#known-limits)).
 
-| Area | Before | Now |
-|---|---|---|
-| Payload | Entered with the +5 / -5 kg buttons (PB6, PC7) or `W <kg>` | Measured by 2 x HX711 strain-gauge bridges. The buttons stay as the manual fallback |
-| Assist payload | Whatever was entered | **Latched** at STANDING -> tipped back: 0.9 x the last valid standing reading, if the assist was switched on at STANDING. Otherwise the manual (button) value |
-| LCD row 0 | `ASSIST:ON   15kg` (entered value) | `ASSIST:ON   22kg` (latched value) or `ASSIST:ON  15kgM` (manual) |
-| LCD row 1 | `DRIVE      FWD` | `DRIVE FWD  HELD` = pose, assist state, load status |
-| IMU | ISM330DHCX with an MPU6050 fallback | ISM330DHCX only (MPU6050 removed); also tries 0x6A, clears a stuck I2C bus at power-up, reconfigures itself if it reads ~0 g |
-| Serial | Motor console only | Motor console plus a load-detect console (`LD`) |
+## How it works in one table
 
-The bench rig's signal chain, filters, gauge views, rest zero, status codes, flash settings layout (v6) and command letters are unchanged.
+| Step | What happens |
+|---|---|
+| **Weigh** | HX711 at 10 Hz → median → zero → final calibration → kg. The trolley must be **exactly upright** (within 2° of the captured upright pose `q s`), still, and not touched for about 1 s. |
+| **AUTO read** | Upright, and the reading holds within ±0.5 kg for 1.5 s: that reading becomes the load (**AUTO**). Standing up again re-reads the total. |
+| **1 click** | Upright: the most recent valid upright reading (up to 3 s before the press) becomes the load (**AUTO**). |
+| **Freeze** | Tipped back or driving: the load stays at its last value |
+| **Assist** | AUTO load × **0.7** (`LOAD_ASSIST_SCALE`). MANUAL load × **1.0** (`MANUAL_ASSIST_SCALE`). |
+| **MANUAL** | At power-up: 15 kg (`PAYLOAD_DEFAULT_KG`). Also after `W <kg>` and after a triple-click zero. |
+| **Zero** | Triple-click while tipped back and empty. Small drift is also corrected automatically within ±3 kg. |
 
 ## Wiring (STM32F407G-DISC1)
 
-| Signal | DISC1 pin |
+| Signal | DISC1 pin | Notes |
+|---|---|---|
+| HX711 #1 (CH1, middle strip) DT / SCK | **PE11 / PE12** | Fitted |
+| HX711 #2 (CH2, left + right strips) DT / SCK | PE13 / PE14 | Not fitted (the boot log says `CH2 MISSING`) |
+| HX711 VCC / GND | **3V** / GND | The DISC1 3V rail is about 3.0 V, so HX711 AVDD is about 2.9 V |
+| HX711 E+ / E− / A+ / A− | Middle-strip half bridge | 2 gauges + 2 × 350 Ω completion resistors. **Solder all of them.** |
+| Status LED | LD4 green (PD12) | Solid = valid; slow blink = settling, held or no calibration; fast blink = fault |
+| IMU ISM330DHCX | PB8 SCL / PB9 SDA, 3V | Pose (upright / tipped back) |
+| LCD (PCF8574 backpack) | **PA8 SCL / PC9 SDA, 5V** | Its own I2C bus (I2C3), separate from the IMU |
+
+The IMU and both HX711s share the board's **3V** rail. A poor 3V or GND contact makes them fail together: the IMU "reads ~0 g", and the HX711 returns −1 or NO_DATA.
+
+## Bridge health (read this first)
+
+At HX711 gain 64 and AVDD 2.9 V:
+
+| Quantity | Value |
 |---|---|
-| HX711 #1 (CH1, middle strip) DT | PE11 |
-| HX711 #1 SCK | PE12 |
-| HX711 #2 (CH2, left + right strips) DT | PE13 |
-| HX711 #2 SCK | PE14 |
-| Both HX711 VCC | **3V** (the DISC1 rail is 3.0 V; not 5V) |
-| Both HX711 GND | GND |
-| Status LED | green LD4 / PD12 (on the board) |
-| IMU ISM330DHCX (3V only) | PB9 SDA / PB8 SCL, shared with the LCD |
+| HX711 input range | **±22.66 mV** (±8,388,608 counts) |
+| 1 kg on the plate | about **2,160 counts** ≈ **6 µV** |
+| Resistance change in one 350 Ω arm that looks like 1 kg | about 0.003 Ω |
+| 1 Ω of contact resistance in one arm | **about 330 kg** |
 
-Both HX711s are on the PE header (PE11-PE14) rather than the Nucleo's PA10/PB3 and PB5/PB4 (PA10 is the DISC1's micro-USB ID line, PB3 the ST-Link SWO line). The bridge wiring is the same as on the bench rig.
+So the bridge must be **balanced** (A+ to A− at rest well inside ±22.66 mV, ideally under ±5 mV), and every joint must be solid. A loose joint changing by an ohm or two looks like hundreds of kilograms.
 
-The Nucleo-G491RE pins (D2-D5, LD2/PA5) are in git history (commit eb04ba3). The payload buttons and assist button still use the Nucleo pins in `board.h` and still need moving for the DISC1.
+| Symptom | Raw data | Cause |
+|---|---|---|
+| `RAIL`, about 2,480 kg, raw stuck at −8,388,608 | A+/A− beyond ±22.66 mV | Bridge badly unbalanced (20–26 mV was measured on 12 Nov), or an arm open |
+| Hundreds to thousands of kg, jumping, sometimes RAIL | Raw jumping by 10⁵–10⁶ counts | Intermittent joint or wire (E±, A±, a gauge or resistor leg) |
+| Empty plate creeps smoothly by kg/s, never returns | Raw ramps smoothly | An input nearly open (floating), or creep in the plate or glue |
+| A large step on the **first** load after a rest, then correct steps | One step of 100–400 kg, later loads correct | The plate seats on its mounting. Seat it (load once, unload) before zeroing. |
+| Huge offset straight after a restart | Normal noise, wrong level | The power-up zero no longer matches the bridge. Triple-click to zero. |
+| −1 samples, NO_DATA | — | HX711 power or DT line dropping. Check the 3V/GND rail and DT/SCK. |
 
-## Operator workflow (F407, handle switch)
+Diagnose from the console: `LD` opens the CSV stream (column `raw`), `b` gives the bridge report, `d` the diagnostic.
 
-One pose definition drives everything (board.h `POSE_FROM_LOAD_REFS`): the captured standing (`q s`) and tipped-back (`q r`) poses decide where the load is accepted **and** what the motors do. Upright = wheels held; tipped back = assist drives; IMU lost = wheels held.
+## Calibration (locked)
+
+The board always uses the **final bench calibration**, recorded in [`host/stm_calibration_middle_FINAL.json`](host/stm_calibration_middle_FINAL.json):
+
+| Item | Value |
+|---|---|
+| Strain gauges used | `x 1`: CH1, middle strip, 2 gauges |
+| Slope / offset | `s 220.3704 -2086.4` (counts/N, counts) |
+| Power-up zero | `z -3028324 0` |
+| HX711 gain | 64 |
+| Fit | R² 0.989, ±1.7 kg over 0–32 kg (bench) |
+
+`board.h` → `LC_FINAL_CAL_LOCK 1` with `LC_FINAL_VIEW / _COUNTS_PER_N / _OFFSET_COUNTS / _ZERO_CH1 / _SIGN_CH1`:
+
+- These values are applied at **every power-up**, whatever is in the flash settings.
+- In the `LD` console, `s`, `c`, `u`, `x` and `i` are **refused**. The exception is `s 220.3704 -2086.4` / `x 1` themselves (what the dashboard sends), which are accepted as a no-op.
+- **To recalibrate** (for example on the trolley, after the bridge is soldered): set `LC_FINAL_CAL_LOCK 0`, flash, and follow the [routine](#calibration-routine). Then put the new values into `LC_FINAL_*` and the FINAL JSON, set the lock back to 1, and flash.
+
+The calibration converts the **change** in counts to kg. Whether the readings are right depends on the zero and on a stable bridge, not on the calibration.
+
+## Zeroing
+
+| Zero | When | Kept |
+|---|---|---|
+| **Power-up zero** | Every restart, including every USB drop: the recorded −3,028,324 | Always this value. **It no longer matches the bridge, so zero after every restart.** |
+| **Triple-click** | Tipped back (IMU required), plate empty, hands off. Uses the samples from just before the first click. | Until restart. **Also sets the load back to MANUAL.** |
+| **Auto-zero** | The reading stays within ±3 kg for 3 s and is stable (with pose gating off, `q 0`, in any pose) | Until restart. Does **not** change the load source. |
+| **Console `t` / `z`** | In the `LD` console, tipped back and empty | `z` saves to flash (the lock still uses the recorded zero at power-up) |
+
+**Zeroing is refused while the HX711 is stuck at its limit** (`REFUSED: HX711 at full scale`), so a disconnected bridge can't be hidden by zeroing onto the limit.
+
+**Routine before a load test:**
+
+1. Restart if needed, then **seat the plate**: put a load on once and take it off.
+2. **Tip back, empty, hands off: triple-click.** It should read about 1 kg (the 0.97 kg calibration offset).
+3. Load, stand it **exactly upright**, hands off for about 1.5 s, and it switches to AUTO.
+4. Drift adds up over minutes, so zero again before each test.
+
+## Operator workflow (handle switch)
 
 | Handle | When | Result |
 |---|---|---|
-| **1 click** | trolley **exactly upright** (within 2 deg of `q s`), hands off the load ~1 s first | the most recent settled reading is **accepted and frozen** as the load; the assist is set for **0.7 x** that load (`LOAD_ASSIST_SCALE`) |
-| **3 quick clicks** | **tipped back**, plate empty | scale **zeroed** (RAM; `LD`, `z`, `LD` saves it) |
-| **hold** (>= 0.4 s) | any time | **assist on**; upright = wheels held, tip back = assist drives; **release = ramp to a stop, then off** |
+| **1 click** (< 0.35 s) | Trolley exactly upright | Takes the most recent valid upright reading as the load: **AUTO**, assist 0.7× |
+| **3 quick clicks** | Tipped back, plate empty | Zero the scale, and the load goes back to **MANUAL** (15 kg / last `W` value, assist 1.0×) |
+| **hold** (≥ 0.4 s) | Any time | Assist on (when the ODrives answer). It drives only when **fully** tipped back. Release → ramp to a stop → assist off after 0.5 s (wheels then roll freely). |
 
-The load the assist uses is 15 kg at power-up (`PAYLOAD_DEFAULT_KG`, assist 10.5 kg) until a load is accepted, or `W <kg>` sets one. While resting tipped back, the scale re-zeroes itself if it stays within +/-3 kg of zero for 3 s.
+Refusals are printed (and translated by `host/live_load_log.py`), for example `not exactly at the standing angle (6.0 deg ...)`, `no settled reading`, `no IMU`.
 
-Live view for anyone running a test: `tools/rtt_server.sh --attach` in one terminal, `python3 host/live_load_log.py` in another (plain language; `--tech` for every value). Data is logged to `data/strain_gauge/live_load_*.csv`.
+There is no upper weight limit. A reading over 150 kg is shown as OVERLOAD, and the click and the auto-read still accept it.
 
-## How the payload reaches the assist
+## Pose references (IMU)
 
-**Measuring (loadcell.c)**
+Upright, tipped back and "fully tipped back for the assist" are all measured against two captured poses:
 
-1. The HX711s convert at 10 Hz. Each conversion is read when it is ready (interrupts off for about 60 us), so the main loop never waits.
-2. The IMU pose decides when a reading counts, as on the bench rig:
-   - **Standing on the toe, hands off for 1 s:** live reading. When it is settled, the status is OK.
-   - **Tipped back or driving:** status HELD.
-   - **Tipped back, empty and still:** the zero follows the reading (rest zero).
-3. The value offered to the assist is 0.9 x measured load, capped at the rated payload (150 kg), and 0 on any fault. Under-assisting is the safe side.
+- **`q s`**: upright, at least 15 kg on, hands off.
+- **`q r`**: empty, fully tipped back at the normal pushing angle.
 
-**Latching into the assist (payload.c)**
+Both are saved in flash. **The IMU board must be fixed rigidly.** If it moves, every angle is wrong.
 
-1. **Switch the assist ON (D8 or B1) while the truck is STANDING.** This arms the latch. The console prints `PAYLOAD: assist ON at STANDING - load will be latched when you tip back.`
-2. While it stands, the firmware remembers the **last valid live reading** (status OK or OVERLOAD).
-3. **Tip it back into DRIVE.** That final standing reading becomes the assist payload and stays fixed for the whole push: `PAYLOAD: latched 22.5 kg for the assist (load detection measured 25.0 kg).`
-4. Standing it up and tipping it back again in the same session (assist still on) re-latches from the new standing period.
+- On 12 Nov the IMU moved while its wires were re-seated. Upright then read 81° from the old reference, so nothing could reach AUTO.
+- `q s` was re-captured on the trolley (upright now reads 0°).
+- **`q r` is still the old default and must be captured on the trolley.**
+- After capturing both, turn pose gating back on with **`q 1`**. It was left at `q 0` from the bench calibration.
 
-**Manual fallback (buttons)**
+```
+LD      q s  (upright, ≥15 kg, hands off)      q r  (empty, fully tipped back)      q 1      LD
+```
 
-| Situation | Assist payload |
-|---|---|
-| Assist switched ON outside STANDING (in DRIVE) | Manual value, no latch |
-| No valid reading while standing (NO_CAL, NO_DATA, IMU_FAULT, never settled) | Manual value, with a message giving the load status |
-| A +/- button pressed (or `W <kg>`) | Manual, starting from the value in use, so a press nudges a latched value by 5 kg |
-| Next armed STANDING -> DRIVE | Load detection latches again |
+## Status codes and the LCD
 
-The manual value starts at `PAYLOAD_DEFAULT_KG` (board.h, 15 kg for the DISC1 bring-up; originally 0) at power-up and is not saved. The payload sets the observer's mass and friction model, and is only pushed when it changes.
+Status codes (CSV, `W`, `PL`): 0 OK, 1 SETTLING, 2 NO_CAL, 3 RAILED, 4 FROZEN, 5 NO_DATA, 6 IMPLAUSIBLE (< −5 or > 225 kg), 7 OVERLOAD (> 150 kg), 8 HELD, 9 IMU_FAULT.
 
-Status codes (CSV and `W`): 0 OK, 1 SETTLING, 2 NO_CAL, 3 RAILED, 4 FROZEN, 5 NO_DATA, 6 IMPLAUSIBLE, 7 OVERLOAD, 8 HELD, 9 IMU_FAULT.
+**LCD line 1:** `UPRIGHT` / `DRIVE` + scale reading:
 
-LCD short forms: `OK`, `SETL`, `NOCAL`, `RAIL`, `FROZ`, `NODAT`, `IMPL`, `OVER`, `HELD`, `IMU!`.
+- `30.2kg` settled
+- `~30.2kg` not settled, or not weighing
+- `!160kg` over 150 kg
+- **Out of range shows the actual value** (`-12.1kg`, `2480kg`), not IMPL
+- `RAIL` / `FROZ` / `NODAT` / `NOCAL` / `IMU!` faults
 
-## Serial commands
+**LCD line 2:** `AUTO` or `MAN` + the weight the assist uses (AUTO 0.7×, MAN 1.0×) + `ON` / `OFF` / `ERR`. In the `LD` console, line 2 reads `LD CONSOLE <status>`.
 
-The motor console (115200, ST-LINK COM port) gains:
+## Serial commands (RTT console)
 
 | Command | Action |
 |---|---|
-| `W` | Payload in use (LATCHED or MANUAL), last latch, manual value, whether the latch is armed, load status |
-| `W <kg>` | Set the manual payload (same as the buttons). Not saved |
-| `W A` | Back to this session's latched value |
-| `LD` | Enter or leave the load-detect console (`LD 1` / `LD 0` force it) |
+| `W` | Load in use (AUTO = accepted from the scale, or MANUAL), assist weight and factor, pose, live status |
+| `W <kg>` | Manual load (assist 1.0×). **Pauses the auto-read until `W A`, a click or a restart.** |
+| `W A` | Back to the last accepted (AUTO) value, auto-read resumes |
+| `PL` / `PL 1` / `PL 0` | Load and payload log (5 Hz stream) used by `host/live_load_log.py` |
+| `LD` | Load-detect console (calibration and diagnostics; the assist is off while it's open) |
+| `LCD` | Scan the LCD bus, report a missing pull-up (wire off) and restart the display |
 
-**The load-detect console** is a maintenance mode for calibration:
+**Load-detect console:**
 
-- All the bench-rig commands work exactly as before: `d b v x t z c s u q g i n f k m h a p r`. See the bench rig's `RUN_GUIDE.md`, section 8.
-- The 10 Hz CSV streams: `t_ms,raw,offset_raw,hx_mV,bridge_uV,microstrain,newtons,valid,status,assist_kg,assist_pct,pose,tilt_deg`.
-- **The assist is switched off on entry and cannot be armed while the console is open.** Calibration commands such as `z`, `c` and `d` block the loop for several seconds.
-- Outside the console, load detection keeps running and only prints faults and recovery (for example `# LOAD NO_DATA: ...`).
+- Commands `d b v x t z c s u q g i n f k m h a p r` (see the bench rig's `RUN_GUIDE.md`; calibration-changing ones are refused while the lock is on).
+- 10 Hz CSV: `t_ms,raw,offset_raw,hx_mV,bridge_uV,microstrain,newtons,valid,status,assist_kg,assist_pct,pose,tilt_deg`.
 
-## Host GUIs
+## Live view and host tools
 
-Copies of the bench-rig GUIs are in `host/`. They now send `LD 1` on connect and `LD 0` on close.
-
-On the DISC1 the ST-Link's USB COM port is not wired to the F407, so the GUIs talk over RTT through the debugger instead, on `socket://localhost:9090` (listed first in the GUIs' port box). One-time setup on Linux: `sudo apt install python3-serial`.
-
-1. Upload the firmware (`pio run -e loadcell_test -t upload` for bench testing) and close the PlatformIO serial monitor.
-2. Terminal 1, leave it running: `tools/rtt_server.sh`
-3. Terminal 2:
+The DISC1 has no serial port to the PC: the console runs over **RTT** through the ST-Link.
 
 ```
-cd host
-python3 stm_dashboard.py      # calibration dashboard
-python3 stm_dual_test.py      # drift / stability test
-python3 stm_dashboard.py socket://localhost:9090 test_01   # straight in
+tools/rtt_server.sh --attach          # terminal 1 (or the PlatformIO serial monitor)
+python3 host/live_load_log.py         # terminal 2: plain-language status (--tech: every value)
 ```
 
-4. Close the GUI, then Ctrl-C in terminal 1 (frees the ST-Link for uploads).
+Logs go to `data/strain_gauge/live_load_*.csv`.
 
-Data is written to `data/strain_gauge/` in this project. The earlier bench data stays in `Code_STM/P102_LoadDetect_Main/data/`.
+**Calibration GUIs** (`host/stm_dashboard.py`, `host/stm_calib_gui.py`, `host/stm_dual_test.py`):
 
-The board **keeps** its saved slope and offset when the dashboard opens (the bench-rig version cleared them with `u` on every launch; on the truck that would leave the assist uncalibrated). To clear every view on purpose, type `u` in the dashboard's command box.
+- Connect to `socket://localhost:9090` and send `LD 1` / `LD 0`.
+- The dashboard loads the FINAL calibration on launch (`--no-final` to skip it).
+- Close them before uploading.
+
+**Every USB drop restarts the board and kills the RTT link.** Restart `rtt_server.sh` (or the monitor), and re-zero.
 
 ## Calibration routine
 
-The trolley is heavy at the back. Empty, it cannot stand on its own: it rests tipped back, and only stands on its toe once the payload outweighs the back, or when someone holds it upright. Two things follow:
+Only needed with `LC_FINAL_CAL_LOCK 0`. The trolley is back-heavy: empty, it rests tipped back. So:
 
-- **The zero is always taken tipped back, empty and hands off.** That is the only empty state the trolley has.
-- **Standing readings do not pass through that zero.** The toe only starts carrying load above a threshold, so the standing line has an **offset** (on the bench rig, middle strip: about 3.1 microstrain per kg and about -39 microstrain offset, about 12.6 kg). With slope only, 15 kg would read about 2.4 kg and 30 kg about 17 kg. With slope **and** offset, both read correctly. The firmware stores both per view (`s <counts/N> <offset>`) and uses `N = (reading - offset) / slope`.
+- the **zero is taken tipped back, empty, hands off**,
+- standing readings have an **offset** (`s <slope> <offset>`, `N = (reading − offset) / slope`).
 
-Steps, in `host/stm_dashboard.py` with **Capture zero + load** (paired capture):
-
-1. **Tip it back, empty, hands off.** Click **Capture zero + load**: it records the zero. It refuses unless the pose is TIPPED BACK and still.
-2. **Stand it up, place 15 kg, let go, wait about 10 s**, then click **Continue: load placed**, with the **total** mass on the plate entered. It refuses unless the pose is STANDING.
-3. Do the same for **30 kg, 40 kg, ...**, each starting with a fresh tipped-back zero, always entering the total.
-4. **Repeat steps 1 to 3 two or three times.** The spread between rounds shows how well the rest zero repeats.
-5. Check the fit: R^2 about 0.999 or better, no curve in the residuals, and a "zero reads as" offset in kg that makes sense for the trolley's balance.
-6. Click **APPLY**. This sends `s <slope> <offset>` and saves both in flash.
+1. Solder the bridge. Check that A+ to A− at rest is under ±5 mV and that the empty reading holds steady for a few minutes.
+2. Capture `q s` and `q r` on the trolley, then `q 1`.
+3. Seat the plate (load once, unload).
+4. In `host/stm_dashboard.py` → **Capture zero + load**: zero (tipped back, empty) → stand it, 15 kg, hands off about 10 s → **Continue** with the **total** mass. Repeat for 30 kg, 40 kg …, each with a fresh zero. Do 2–3 rounds.
+5. Check: R² ≥ 0.999, no curve in the residuals, a sensible offset. Then **APPLY**.
+6. Copy the result into `LC_FINAL_*` and the FINAL JSON, and set the lock back to 1.
 
 Rules:
 
-- **Every calibration load must stand the trolley by itself.** 15 kg is the lowest step. 2.5 kg does not stand it, so don't use it.
-- **Never capture while someone holds the trolley upright.** A hand on the handle adds force the plate does not see. The firmware also treats any movement in the last second as "being handled" (status SETTLING), and the dashboard refuses a standing capture in the wrong pose.
-- Capture the IMU poses first: **`q s` standing with at least 15 kg on, hands off**, and **`q r` empty, resting tipped back**.
-- In use it works the same way: the zero follows by itself while the trolley rests tipped back (rest zero), and readings count when it stands.
-- **The offset is a property of the trolley's own weight and balance.** It stays valid until something moves. **Recalibrate if the battery, motors or handle are moved, added or removed.**
-- `c <N>` (one-point calibration) sets offset 0. Don't use it for this trolley.
-
-## Bring-up on the truck (to do)
-
-1. Wire the HX711s (table above). Measure 3V3 to GND for a short before powering up.
-2. Flash the firmware (`loadcell_test` for bench work: load detection + IMU only, LD console on from boot, no CAN or motors). The boot log should show `LOAD: HX711 CH1 ok, CH2 ok | ...`. On a fresh board it also shows `view not calibrated -> assist payload 0 kg (NO_CAL)`.
-3. `LD`, then `b` and `d`: check that both channels respond.
-4. Capture the IMU poses for the load plate: standing with at least 15 kg on and hands off, `q s`; tipped back and empty, `q r`. The defaults were measured on the truck (standing about -43.6 deg, tipped back about -1.2 deg pitch), but capturing them is more accurate.
-5. Calibrate with `host/stm_dashboard.py`: save zero (tipped back, empty), check signs, then follow the **Calibration routine** above for 2 SG and 4 SG, balance g, and finally All 6 (the view the assist uses).
-6. `LD` to leave. Stand it loaded, switch the assist ON, wait for `W` to show a valid reading, tip back: the console prints `PAYLOAD: latched ... kg` and the LCD shows it without `M`.
-7. Safety checks (FR1 to FR3, keep the logs):
-
-| Check | Expected |
-|---|---|
-| Unplug one HX711 DT wire, then arm at STANDING and tip back | `LOAD NO_DATA` within 0.5 s, LCD `NODAT`; on tipping back `no valid load reading` and the manual value is used |
-| Switch the assist on in DRIVE | `assist ON outside STANDING`, manual value, no latch |
-| Press + / - during a push | Payload changes by 5 kg, LCD shows `M` |
-| Unplug the IMU | About 0.1 s later: `LOAD: IMU lost`, LCD `IMU!` |
-| Open `LD` with the assist on | Assist switches off; D8 / B1 / `AS 1` are refused until `LD` is closed |
-| Power-cycle | Zero, scales, g, signs and pose references are kept (`LD`, `b`) |
+- Every calibration load must stand the trolley by itself (15 kg minimum).
+- Never capture while the handle is held.
+- Recalibrate after moving the battery, motors or handle.
+- Don't use `c <N>` (it forces offset 0).
 
 ## Known limits
 
-- **Not run on the F407 yet.** HX711 timing uses the DWT cycle counter, so it should carry over at 168 MHz. Settings are saved in flash sector 11 (0x080E0000): a save stalls the CPU for about 1-2 s (it was about 20 ms on the G4's 2 KB page). It only happens from console commands, while the assist is off.
-- There is no backup IMU. If the ISM330DHCX fails, the status goes to IMU_FAULT and the payload drops to 0 kg. The pose machine also loses its pitch reading.
-- The LCD backpack shares the I2C bus. If its SDA / SCL pull-ups go to 5 V, they over-drive the 3.3 V-only ISM330DHCX. Measure SDA and SCL to GND with power on: they should read about 3.3 V.
-- Front-to-back load placement error and toe friction (bench-rig `CONTEXT.md`) are unchanged.
+- **Bridge stability:**
+    - Push-on and unsoldered connections cause offsets, jumps and RAIL (see [Bridge health](#bridge-health-read-this-first)).
+    - The empty plate drifts by a few kg per minute.
+    - The plate shifts on the first load after a rest.
+    - Fix: solder everything, add strain relief, and fix the plate mounting.
+- **The power-up zero doesn't match the bridge** since it was rewired, so zero after every restart.
+- **USB drops** (laptop-powered board) restart the board, which loses the zero and the accepted load.
+- **The 3V/GND rail** shared by the IMU and the HX711 is marginal: the IMU resets and reads 0 g, the HX711 returns −1.
+- **IMU and LCD wires** have come loose repeatedly, and the IMU board moved, so mount and secure them.
+- **`q r` is the old default** and needs capturing on the trolley. Pose gating is off (`q 0`).
+- **Bench calibration only** (R² 0.989, ±1.7 kg). The middle strip only; the side strips (CH2) aren't fitted.
 
 ## Files
 
 | File | Role |
 |---|---|
-| `src/loadcell.c`, `include/loadcell.h` | Load-detection subsystem (bench-rig v4.2 port, changes marked `[RT]`) |
-| `src/imu.c`, `src/ism330.c` | IMU layer (ISM330DHCX only): `imuGetLatest()`, 0x6A fallback, bus clear, cart-frame signs in `board.h` |
-| `src/payload.c`, `include/payload.h` | Latch on STANDING -> DRIVE (if armed at STANDING), manual fallback, sends the payload to the observer |
-| `src/main.c` | `loadcellInit()` / `loadcellUpdate()`, `payloadInit()` / `payloadUpdate()` |
-| `src/command.c` | `LD` console routing, `W` / `W <kg>` / `W A`, junk-byte filter |
-| `src/admittance.c` | Assist refused while the console is open |
-| `src/display.c` | New LCD layout |
-| `src/mode_input.c`, `include/board.h` | Payload buttons now set the manual payload in payload.c, HX711 pins added |
-| `host/` | Bench-rig GUIs with the `LD` handshake; the dashboard no longer clears the calibration on launch |
+| `src/loadcell.c`, `include/loadcell.h` | Load detection: HX711, filters, zero (rail guard), final-calibration lock, pose, status codes, `LD` console |
+| `src/payload.c`, `include/payload.h` | Load in use: AUTO read (steady window), click accept, manual lock, zero → MANUAL, AUTO 0.7× / MAN 1.0× |
+| `src/deadman.c` | Handle gestures (click, triple-click, hold) |
+| `src/display.c`, `src/lcd_i2c.c` | LCD layout, own I2C3 bus, `LCD` diagnostics |
+| `src/command.c` | `W`, `PL`, `LD`, `LCD` commands |
+| `include/board.h` | Pins, `LC_FINAL_*`, `PAYLOAD_*`, `LOAD_ASSIST_SCALE`, `MANUAL_ASSIST_SCALE`, LCD bus |
+| `host/` | `live_load_log.py`, calibration GUIs, `stm_calibration_middle_FINAL.json` |

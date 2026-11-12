@@ -2,9 +2,91 @@
 #include "board.h"
 #include "stm32f4xx_hal.h"
 
+#include <stdio.h>
 #include <string.h>
 
+#if LCD_I2C_SEPARATE_BUS
+/* Own bus (board.h: I2C3 on PA8 SCL / PC9 SDA); MSP in stm32f4xx_hal_msp.c. */
+I2C_HandleTypeDef hi2c_lcd;
+#define LCD_BUS (&hi2c_lcd)
+
+/* Free a slave left holding SDA low (e.g. reset mid-transfer): up to 9 SCL
+ * pulses with the pins as open-drain GPIO, then a STOP.  The pins are put
+ * back on the I2C alternate function by HAL_I2C_Init's MspInit. */
+static void lcd_bus_clear(void)
+{
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    GPIO_InitTypeDef g = {0};
+    g.Mode  = GPIO_MODE_OUTPUT_OD;
+    g.Pull  = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    g.Pin = LCD_I2C_SCL_PIN; HAL_GPIO_Init(LCD_I2C_SCL_PORT, &g);
+    g.Pin = LCD_I2C_SDA_PIN; HAL_GPIO_Init(LCD_I2C_SDA_PORT, &g);
+    HAL_GPIO_WritePin(LCD_I2C_SDA_PORT, LCD_I2C_SDA_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(LCD_I2C_SCL_PORT, LCD_I2C_SCL_PIN, GPIO_PIN_SET);
+    for (int i = 0; i < 9 && HAL_GPIO_ReadPin(LCD_I2C_SDA_PORT, LCD_I2C_SDA_PIN) == GPIO_PIN_RESET; i++) {
+        HAL_GPIO_WritePin(LCD_I2C_SCL_PORT, LCD_I2C_SCL_PIN, GPIO_PIN_RESET); HAL_Delay(1);
+        HAL_GPIO_WritePin(LCD_I2C_SCL_PORT, LCD_I2C_SCL_PIN, GPIO_PIN_SET);   HAL_Delay(1);
+    }
+    HAL_GPIO_WritePin(LCD_I2C_SDA_PORT, LCD_I2C_SDA_PIN, GPIO_PIN_RESET); HAL_Delay(1);  /* STOP */
+    HAL_GPIO_WritePin(LCD_I2C_SDA_PORT, LCD_I2C_SDA_PIN, GPIO_PIN_SET);   HAL_Delay(1);
+}
+
+/* STM32F4 errata (I2C analog filter): the BUSY flag can latch with both lines
+ * high, and every transfer then fails at once with HAL_BUSY.  ST workaround:
+ * peripheral off, walk SDA/SCL low and high as GPIO, back to AF, SWRST. */
+static void lcd_bus_unstick(void)
+{
+    hi2c_lcd.Instance->CR1 &= ~I2C_CR1_PE;
+    GPIO_InitTypeDef g = {0};
+    g.Mode  = GPIO_MODE_OUTPUT_OD;
+    g.Pull  = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    g.Pin = LCD_I2C_SCL_PIN; HAL_GPIO_Init(LCD_I2C_SCL_PORT, &g);
+    g.Pin = LCD_I2C_SDA_PIN; HAL_GPIO_Init(LCD_I2C_SDA_PORT, &g);
+    HAL_GPIO_WritePin(LCD_I2C_SCL_PORT, LCD_I2C_SCL_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(LCD_I2C_SDA_PORT, LCD_I2C_SDA_PIN, GPIO_PIN_SET);   HAL_Delay(1);
+    HAL_GPIO_WritePin(LCD_I2C_SDA_PORT, LCD_I2C_SDA_PIN, GPIO_PIN_RESET); HAL_Delay(1);
+    HAL_GPIO_WritePin(LCD_I2C_SCL_PORT, LCD_I2C_SCL_PIN, GPIO_PIN_RESET); HAL_Delay(1);
+    HAL_GPIO_WritePin(LCD_I2C_SCL_PORT, LCD_I2C_SCL_PIN, GPIO_PIN_SET);   HAL_Delay(1);
+    HAL_GPIO_WritePin(LCD_I2C_SDA_PORT, LCD_I2C_SDA_PIN, GPIO_PIN_SET);   HAL_Delay(1);
+    g.Mode      = GPIO_MODE_AF_OD;
+    g.Speed     = GPIO_SPEED_FREQ_HIGH;
+    g.Alternate = LCD_I2C_GPIO_AF;
+    g.Pin = LCD_I2C_SCL_PIN; HAL_GPIO_Init(LCD_I2C_SCL_PORT, &g);
+    g.Pin = LCD_I2C_SDA_PIN; HAL_GPIO_Init(LCD_I2C_SDA_PORT, &g);
+    hi2c_lcd.Instance->CR1 |= I2C_CR1_SWRST;
+    hi2c_lcd.Instance->CR1 &= ~I2C_CR1_SWRST;
+}
+
+static bool lcd_bus_busy(void) { return (hi2c_lcd.Instance->SR2 & I2C_SR2_BUSY) != 0; }
+
+static bool lcd_bus_init(void)
+{
+    lcd_bus_clear();
+    if (hi2c_lcd.State != HAL_I2C_STATE_RESET) (void)HAL_I2C_DeInit(&hi2c_lcd);
+    hi2c_lcd.Instance             = LCD_I2C_INSTANCE;
+    hi2c_lcd.Init.ClockSpeed      = LCD_I2C_CLOCK_HZ;
+    hi2c_lcd.Init.DutyCycle       = I2C_DUTYCYCLE_2;
+    hi2c_lcd.Init.OwnAddress1     = 0;
+    hi2c_lcd.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
+    hi2c_lcd.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c_lcd.Init.OwnAddress2     = 0;
+    hi2c_lcd.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c_lcd.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
+    if (HAL_I2C_Init(&hi2c_lcd) != HAL_OK) return false;
+    if (lcd_bus_busy()) {                       /* errata: BUSY latched -> unstick, re-init */
+        lcd_bus_unstick();
+        (void)HAL_I2C_DeInit(&hi2c_lcd);
+        if (HAL_I2C_Init(&hi2c_lcd) != HAL_OK) return false;
+    }
+    return !lcd_bus_busy();
+}
+#else
 extern I2C_HandleTypeDef hi2c_imu;   /* LCD shares I2C1 with the ISM330DHCX */
+#define LCD_BUS (&hi2c_imu)
+#endif
 
 /* PCF8574 backpack wiring: P0=RS, P1=RW, P2=EN, P3=backlight, P4..P7=D4..D7.
  * RW (P1) is held low - this driver only ever writes. */
@@ -36,7 +118,7 @@ static uint32_t s_last_refresh_ms = 0;
 static bool lcd_write_raw(uint8_t value)
 {
     if (!s_present) return false;
-    return HAL_I2C_Master_Transmit(&hi2c_imu, s_addr_hal, &value, 1,
+    return HAL_I2C_Master_Transmit(LCD_BUS, s_addr_hal, &value, 1,
                                    LCD_I2C_TIMEOUT_MS) == HAL_OK;
 }
 
@@ -65,20 +147,29 @@ static void pad16(char *dst, const char *src)
  * ---------------------------------------------------------------------*/
 static bool probe_addr(uint8_t addr_7bit)
 {
-    return HAL_I2C_IsDeviceReady(&hi2c_imu, (uint16_t)(addr_7bit << 1), 2,
+    return HAL_I2C_IsDeviceReady(LCD_BUS, (uint16_t)(addr_7bit << 1), 2,
                                  LCD_I2C_TIMEOUT_MS) == HAL_OK;
 }
 
 bool lcdBegin(void)
 {
-    if (probe_addr(LCD_I2C_ADDR_PRIMARY)) {
-        s_addr_hal = (uint8_t)(LCD_I2C_ADDR_PRIMARY << 1);
-    } else if (probe_addr(LCD_I2C_ADDR_FALLBACK)) {
-        s_addr_hal = (uint8_t)(LCD_I2C_ADDR_FALLBACK << 1);
-    } else {
-        s_present = false;
-        return false;
+#if LCD_I2C_SEPARATE_BUS
+    if (!lcd_bus_init()) { s_present = false; return false; }
+#endif
+    s_present = false;
+    uint8_t found = 0;
+    if (probe_addr(LCD_I2C_ADDR_PRIMARY))       found = LCD_I2C_ADDR_PRIMARY;
+    else if (probe_addr(LCD_I2C_ADDR_FALLBACK)) found = LCD_I2C_ADDR_FALLBACK;
+    else {
+        /* Any PCF8574 (0x20-0x27) / PCF8574A (0x38-0x3F) address - backpacks
+         * with the A0-A2 jumpers bridged sit elsewhere in these ranges. */
+        for (uint8_t a = 0x20u; a <= 0x3Fu && !found; a++) {
+            if (a == 0x28u) a = 0x38u;
+            if (probe_addr(a)) found = a;
+        }
     }
+    if (!found) return false;
+    s_addr_hal = (uint8_t)(found << 1);
     s_present = true;
     HAL_Delay(50);
 
@@ -103,6 +194,126 @@ bool lcdBegin(void)
 }
 
 bool lcdIsPresent(void) { return s_present; }
+
+uint8_t lcdAddress(void) { return s_present ? (uint8_t)(s_addr_hal >> 1) : 0u; }
+
+#if LCD_I2C_SEPARATE_BUS
+/* ---- software (bit-banged) probe, independent of the I2C3 peripheral ----
+ * Run twice: as wired (SCL PA8, SDA PC9) and with the two lines swapped. */
+static GPIO_TypeDef *bb_scl_port, *bb_sda_port;
+static uint16_t      bb_scl_pin,   bb_sda_pin;
+static void bb_delay(void) { for (volatile int i = 0; i < 300; i++) { } }   /* ~5 us at 168 MHz */
+static void bb_scl(int v) { HAL_GPIO_WritePin(bb_scl_port, bb_scl_pin, v ? GPIO_PIN_SET : GPIO_PIN_RESET); bb_delay(); }
+static void bb_sda(int v) { HAL_GPIO_WritePin(bb_sda_port, bb_sda_pin, v ? GPIO_PIN_SET : GPIO_PIN_RESET); bb_delay(); }
+static int  bb_sda_in(void) { return HAL_GPIO_ReadPin(bb_sda_port, bb_sda_pin) == GPIO_PIN_SET; }
+
+static bool bb_probe(uint8_t addr7)
+{
+    bb_sda(1); bb_scl(1);
+    bb_sda(0); bb_scl(0);                              /* START */
+    uint8_t byte = (uint8_t)(addr7 << 1);              /* write */
+    for (int i = 7; i >= 0; i--) { bb_sda((byte >> i) & 1); bb_scl(1); bb_scl(0); }
+    bb_sda(1); bb_scl(1);                              /* release SDA, 9th clock */
+    bool ack = !bb_sda_in();
+    bb_scl(0);
+    bb_sda(0); bb_scl(1); bb_sda(1);                   /* STOP */
+    return ack;
+}
+
+static int bb_scan_once(void (*print)(const char *), const char *label)
+{
+    char b[96];
+    int n = 0;
+    for (uint8_t a = 0x08u; a < 0x78u; a++) {
+        if (bb_probe(a)) { snprintf(b, sizeof b, "    0x%02X answers (%s)\r\n", a, label); print(b); n++; }
+    }
+    snprintf(b, sizeof b, "    %s: %d device(s)\r\n", label, n);
+    print(b);
+    return n;
+}
+
+static void bb_scan(void (*print)(const char *))
+{
+    hi2c_lcd.Instance->CR1 &= ~I2C_CR1_PE;
+    GPIO_InitTypeDef g = {0};
+    g.Mode  = GPIO_MODE_OUTPUT_OD;
+    g.Pull  = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    g.Pin = LCD_I2C_SCL_PIN; HAL_GPIO_Init(LCD_I2C_SCL_PORT, &g);
+    g.Pin = LCD_I2C_SDA_PIN; HAL_GPIO_Init(LCD_I2C_SDA_PORT, &g);
+    /* A line that is not idle-high (held low, or nothing connected to pull it up)
+     * makes every address look like it answers - report it and skip the scan. */
+    {
+        /* inputs with the internal PULL-DOWN: only the backpack's pull-up can make them read high */
+        GPIO_InitTypeDef t = {0};
+        t.Mode = GPIO_MODE_INPUT; t.Pull = GPIO_PULLDOWN;
+        t.Pin = LCD_I2C_SCL_PIN; HAL_GPIO_Init(LCD_I2C_SCL_PORT, &t);
+        t.Pin = LCD_I2C_SDA_PIN; HAL_GPIO_Init(LCD_I2C_SDA_PORT, &t);
+        HAL_Delay(2);
+        const int scl = HAL_GPIO_ReadPin(LCD_I2C_SCL_PORT, LCD_I2C_SCL_PIN) == GPIO_PIN_SET;
+        const int sda = HAL_GPIO_ReadPin(LCD_I2C_SDA_PORT, LCD_I2C_SDA_PIN) == GPIO_PIN_SET;
+        g.Pin = LCD_I2C_SCL_PIN; HAL_GPIO_Init(LCD_I2C_SCL_PORT, &g);     /* back to open-drain, no pull */
+        g.Pin = LCD_I2C_SDA_PIN; HAL_GPIO_Init(LCD_I2C_SDA_PORT, &g);
+        if (!scl || !sda) {
+            if (!scl) print("  -> SCL (PA8): no pull-up from the backpack - wire not connected to the "
+                            "backpack's SCL pin, or shorted to GND.\r\n");
+            if (!sda) print("  -> SDA (PC9): no pull-up from the backpack - wire not connected to the "
+                            "backpack's SDA pin, or shorted to GND (e.g. on its GND pin).\r\n");
+            (void)lcd_bus_init();
+            return;
+        }
+    }
+    print("  software scan (pins driven directly, no I2C peripheral):\r\n");
+    bb_scl_port = LCD_I2C_SCL_PORT; bb_scl_pin = LCD_I2C_SCL_PIN;
+    bb_sda_port = LCD_I2C_SDA_PORT; bb_sda_pin = LCD_I2C_SDA_PIN;
+    int n = bb_scan_once(print, "as wired: SCL PA8, SDA PC9");
+    bb_scl_port = LCD_I2C_SDA_PORT; bb_scl_pin = LCD_I2C_SDA_PIN;
+    bb_sda_port = LCD_I2C_SCL_PORT; bb_sda_pin = LCD_I2C_SCL_PIN;
+    int m = bb_scan_once(print, "SWAPPED: SCL PC9, SDA PA8");
+    if (!n && m) print("  -> the LCD answers with SDA/SCL SWAPPED: swap the two wires.\r\n");
+    if (!n && !m) print("  -> nothing answers either way: check LCD VCC 5V + GND, and that the\r\n"
+                        "     wires really go to PA8 / PC9 (and the backpack is plugged onto the LCD).\r\n");
+    (void)lcd_bus_init();                               /* back to the I2C3 peripheral */
+}
+#endif
+
+/* Console `LCD`: bus state + every address that answers, via print(). */
+void lcdDiagnose(void (*print)(const char *))
+{
+    char b[160];
+#if LCD_I2C_SEPARATE_BUS
+    if (hi2c_lcd.State == HAL_I2C_STATE_RESET && !lcd_bus_init()) {
+        print("LCD bus: I2C3 init failed or BUSY stuck.\r\n");
+    }
+    snprintf(b, sizeof b, "LCD bus I2C3 (SCL PA8 = %d, SDA PC9 = %d, BUSY = %d):\r\n",
+             (int)HAL_GPIO_ReadPin(LCD_I2C_SCL_PORT, LCD_I2C_SCL_PIN),
+             (int)HAL_GPIO_ReadPin(LCD_I2C_SDA_PORT, LCD_I2C_SDA_PIN), (int)lcd_bus_busy());
+    print(b);
+    if (lcd_bus_busy()) { lcd_bus_unstick(); print("  BUSY was stuck - bus reset (errata workaround).\r\n"); }
+#else
+    print("LCD bus: shared I2C1 (see I2C):\r\n");
+#endif
+    int n = 0;
+    for (uint8_t a = 0x08u; a < 0x78u; a++) {
+        if (probe_addr(a)) {
+            snprintf(b, sizeof b, "  0x%02X answers%s\r\n", a,
+                     ((a >= 0x20u && a <= 0x27u) || (a >= 0x38u && a <= 0x3Fu)) ? "  (PCF8574 LCD backpack range)" : "");
+            print(b);
+            n++;
+        }
+    }
+    snprintf(b, sizeof b, "  %d device(s) found by I2C3 (BUSY now %d).%s\r\n", n,
+#if LCD_I2C_SEPARATE_BUS
+             (int)lcd_bus_busy(),
+#else
+             0,
+#endif
+             n ? "" : "");
+    print(b);
+#if LCD_I2C_SEPARATE_BUS
+    if (!n) bb_scan(print);
+#endif
+}
 
 void lcdSetLines(const char *line0, const char *line1)
 {

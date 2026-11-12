@@ -15,7 +15,8 @@ How to use the handle:
   1 click  while UPRIGHT (hands off the load for ~1 s)  -> accept the load
   3 clicks while TIPPED BACK, plate empty                -> zero the scale
   hold                                                   -> assist on (release = stop)
-The assist is always set for 0.7 x the accepted load (never more than the real load).
+The assist is set for 0.7 x a MEASURED load (never more than the real load), and
+1.0 x a MANUAL load (the 15 kg power-up default or 'W <kg>').
 """
 
 import argparse
@@ -70,8 +71,8 @@ def load_text(r):
     if st == "NO_CAL":
         return col("scale not calibrated", "r")
     if st == "IMU_FAULT":
-        return col("needs the tilt sensor", "r")
-    return col("sensor problem - check wiring / zero", "r")
+        return col(f"{kg:5.1f} kg (tilt sensor needed)", "r")
+    return col(f"{kg:5.1f} kg (not used: {st.lower()})", "r")     # always show the actual value
 
 
 def status_line(r):
@@ -88,12 +89,16 @@ def status_line(r):
 _EVENTS = [
     (r"PAYLOAD: ACCEPTED - load initialised ([\d.]+) kg -> assist payload ([\d.]+) kg",
      lambda m: col(f"[OK] Load accepted: {m[1]} kg  ->  assist will help with {m[2]} kg", "g")),
+    (r"PAYLOAD: load (?:detected|updated) ([\d.]+) kg \(upright, auto\) -> assist payload ([\d.]+) kg",
+     lambda m: col(f"[OK] Load read: {m[1]} kg  ->  assist will help with {m[2]} kg", "g")),
     (r"not exactly at the standing angle \(([\d.]+) deg",
      lambda m: col(f"[X] Load NOT accepted - trolley is {float(m[1]):.0f} deg from upright. Stand it fully up and click once.", "r")),
     (r"no settled reading",
      lambda m: col("[X] Load NOT accepted - keep hands off the load for about 1 second, then click once.", "r")),
     (r"PAYLOAD: not accepted - no IMU",
      lambda m: col("[X] Load NOT accepted - the tilt sensor is not working.", "r")),
+    (r"PAYLOAD: scale zeroed - load back to MANUAL ([\d.]+) kg",
+     lambda m: col(f"[i] Load back to manual {m[1]} kg (scale zeroed).", "y")),
     (r"ZEROED by handle triple-click",
      lambda m: col("[OK] Scale zeroed (empty).", "g")),
     (r"handle zero refused - not tipped back",

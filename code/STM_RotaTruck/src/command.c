@@ -21,6 +21,8 @@
 #include "payload.h"
 #include "deadman.h"
 #include "rtt.h"
+#include "lcd_i2c.h"
+#include "display.h"
 #include "stm32f4xx_hal.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -102,7 +104,7 @@ static uint32_t is_stream_last = 0;
 /* Load / payload live log (PL 1 / PL 0 / PL S, 5 Hz; host/live_load_log.py).
  * PL,t_ms,handle,pitch_deg,lc_pose,stand_dev_deg,rest_dev_deg,load_status,measured_kg,
  *    offer_kg,load_kg,payload_kg,payload_src,assist_on,assist_pose
- *    (load_kg = initialised load, payload_kg = LOAD_ASSIST_SCALE x load_kg) */
+ *    (load_kg = initialised load, payload_kg = payloadAssistScale() x load_kg: AUTO 0.7, MANUAL 1.0) */
 static bool     pl_stream_on   = false;
 static uint32_t pl_stream_last = 0;
 
@@ -302,6 +304,15 @@ static void execute_line(const char *line)
             imuScanBus();
             return;
         }
+        if (strlen(tokv[0]) == 3 && up(tokv[0][0]) == 'L' &&
+            up(tokv[0][1]) == 'C' && up(tokv[0][2]) == 'D') {
+            /* LCD bus scan, then (re)start the display - it is only looked
+             * for at boot otherwise, so a late-plugged LCD comes up here. */
+            lcdDiagnose(uart_print);
+            if (displayInit()) uart_printf("LCD: detected at 0x%02X - display running.\r\n", lcdAddress());
+            else               uart_print("LCD: still not detected.\r\n");
+            return;
+        }
         goto err_syntax;
     }
 
@@ -411,7 +422,7 @@ static void execute_line(const char *line)
             if (end == tokv[1]) goto err_syntax;
             payloadSetManual(kg);
             uart_printf("OK: load = %.1f kg MANUAL -> assist payload %.1f kg (%.2f x)\r\n",
-                        (double)payloadGetLoadKg(), (double)payloadGetKg(), (double)LOAD_ASSIST_SCALE);
+                        (double)payloadGetLoadKg(), (double)payloadGetKg(), (double)payloadAssistScale());
         }
         return;
     }
@@ -781,6 +792,7 @@ static void print_help(void)
         "  IC               Calibrate IMU in current pose\r\n"
         "  I2C              Scan the I2C bus (lists IMU / LCD addresses)\r\n"
         "  I B              2 s still test: gyro bias + noise, |a| (assist off)\r\n"
+        "  LCD              Scan the LCD bus (I2C3 PA8/PC9) and (re)start the LCD\r\n"
         "\r\n"
         "Observer (operator-force estimate, read-only):\r\n"
         "  OB               One-shot: Fext (push N), Mext (twist Nm), v, Fmot\r\n"

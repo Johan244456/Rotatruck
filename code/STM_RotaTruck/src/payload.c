@@ -18,8 +18,9 @@
 typedef enum { SRC_MANUAL = 0, SRC_LATCHED } payload_src_t;
 
 static payload_src_t s_src        = SRC_MANUAL;
-/* Both hold the INITIALISED LOAD (kg on the trolley); the assist always gets
- * LOAD_ASSIST_SCALE x that load (payloadGetKg) - never more than the real load. */
+/* Both hold the INITIALISED LOAD (kg on the trolley); the assist gets
+ * LOAD_ASSIST_SCALE (0.7) x a MEASURED load - never more than the real load -
+ * and MANUAL_ASSIST_SCALE (1.0) x a manual one (payloadGetKg). */
 static float         s_manual_kg  = PAYLOAD_DEFAULT_KG;   /* load: buttons / W, board.h default, not saved */
 
 /* latch state */
@@ -34,11 +35,17 @@ static float    s_stand_ok_kg       = 0.0f;   /* LOAD_ASSIST_SCALE x measured   
 static float    s_stand_ok_measured = 0.0f;
 static uint32_t s_stand_ok_ms       = 0;      /* when it was taken                 */
 static bool     s_prev_standing     = false;  /* load-detect pose, previous pass   */
+/* auto-read safety: steady-reading window and the manual override */
+static float    s_auto_ref_kg       = 0.0f;   /* reading the steady window started at */
+static uint32_t s_auto_since_ms     = 0;      /* 0 = no window running              */
+static bool     s_manual_lock       = false;  /* `W <kg>`: auto-read paused           */
 static bool     s_prev_handle       = true;   /* must be seen released first       */
 
 /* edge detection */
 static bool      s_prev_enabled   = false;
 static TruckPose s_prev_pose      = POSE_STANDING;
+
+static void push_to_observer(void);
 
 static float clamp_manual(float kg)
 {
@@ -48,7 +55,9 @@ static float clamp_manual(float kg)
 }
 
 float payloadGetLoadKg(void) { return (s_src == SRC_LATCHED) ? s_latched_kg : s_manual_kg; }
-float payloadGetKg(void)     { return LOAD_ASSIST_SCALE * payloadGetLoadKg(); }
+/* AUTO (measured) load -> LOAD_ASSIST_SCALE (0.7); MANUAL -> MANUAL_ASSIST_SCALE (1.0). */
+float payloadAssistScale(void) { return (s_src == SRC_LATCHED) ? LOAD_ASSIST_SCALE : MANUAL_ASSIST_SCALE; }
+float payloadGetKg(void)     { return payloadAssistScale() * payloadGetLoadKg(); }
 bool  payloadIsManual(void) { return s_src == SRC_MANUAL; }
 
 void payloadInit(void)
@@ -57,7 +66,7 @@ void payloadInit(void)
     s_manual_kg = PAYLOAD_DEFAULT_KG;
     uart_printf("PAYLOAD: initialised load %.1f kg at power-up (board.h PAYLOAD_DEFAULT_KG; 'W <kg>' "
                 "to change) -> assist payload %.1f kg (%.2f x).\r\n", (double)s_manual_kg,
-                (double)payloadGetKg(), (double)LOAD_ASSIST_SCALE);
+                (double)payloadGetKg(), (double)payloadAssistScale());
     s_armed_at_standing = s_have_latch = s_stand_ok = false;
     s_prev_enabled = admittanceIsEnabled();
     s_prev_pose    = assistGetPose();
@@ -111,6 +120,7 @@ static void accept_on_press(uint32_t now)
     s_latched_measured = s_stand_ok_measured;
     s_have_latch       = true;
     s_src              = SRC_LATCHED;
+    s_manual_lock      = false;               /* a click hands back to the scale */
     uart_printf("PAYLOAD: ACCEPTED - load initialised %.1f kg -> assist payload %.1f kg (%.2f x).\r\n",
                 (double)load, (double)payloadGetKg(), (double)LOAD_ASSIST_SCALE);
 }
@@ -131,20 +141,38 @@ void payloadUpdate(void)
     const uint32_t now      = HAL_GetTick();
     const bool     standing = loadcellPoseStanding();
     if (standing && !s_prev_standing) s_stand_ok = false;      /* new standing period */
-    /* only readings taken AT the standing angle (<= PAYLOAD_ACCEPT_MAX_DEV_DEG) can be accepted */
-    if (standing && loadcellStandDevDeg() <= PAYLOAD_ACCEPT_MAX_DEV_DEG) {
-        loadcell_status_t st = loadcellStatus();
-        if (st == LC_ST_OK || st == LC_ST_OVERLOAD) {
-            s_stand_ok          = true;
-            s_stand_ok_measured = loadcellMeasuredKg();
-            s_stand_ok_kg       = LOAD_ASSIST_SCALE * s_stand_ok_measured;
-            s_stand_ok_ms       = now;
+    /* Readings taken AT the standing angle (<= PAYLOAD_ACCEPT_MAX_DEV_DEG) with a valid status
+     * (OK or OVERLOAD).  A handle CLICK accepts the most recent one (as before); the AUTO-read
+     * additionally needs it STEADY (+/-PAYLOAD_AUTO_STABLE_KG for PAYLOAD_AUTO_STABLE_MS). */
+    bool steady = false;
+    const loadcell_status_t st_now = loadcellStatus();
+    const bool valid_upright = standing && loadcellStandDevDeg() <= PAYLOAD_ACCEPT_MAX_DEV_DEG &&
+                               (st_now == LC_ST_OK || st_now == LC_ST_OVERLOAD);
+    if (valid_upright) {                         /* click: most recent valid upright reading */
+        s_stand_ok          = true;
+        s_stand_ok_measured = loadcellMeasuredKg();
+        s_stand_ok_kg       = LOAD_ASSIST_SCALE * s_stand_ok_measured;
+        s_stand_ok_ms       = now;
+    }
+    if (valid_upright) {
+        const float m = loadcellMeasuredKg();
+        if (s_auto_since_ms == 0 || fabsf(m - s_auto_ref_kg) > PAYLOAD_AUTO_STABLE_KG) {
+            s_auto_ref_kg = m; s_auto_since_ms = now ? now : 1;      /* (re)start the window */
+        } else if ((uint32_t)(now - s_auto_since_ms) >= PAYLOAD_AUTO_STABLE_MS) {
+            steady = true;
+        }
+    } else {
+        s_auto_since_ms = 0;
+    }
+    if (steady) {
+        {
 #if PAYLOAD_AUTO_ACCEPT
             /* exactly upright + settled: this IS the load (frozen once it tips back) */
             float load = s_stand_ok_measured;
             if (load < 0.0f) load = 0.0f;
             if (load > UI_PAYLOAD_MAX_KG) load = UI_PAYLOAD_MAX_KG;
-            if (s_src != SRC_LATCHED || fabsf(load - s_latched_kg) > PAYLOAD_AUTO_MIN_CHANGE_KG) {
+            if (!s_manual_lock &&
+                (s_src != SRC_LATCHED || fabsf(load - s_latched_kg) > PAYLOAD_AUTO_MIN_CHANGE_KG)) {
                 const bool first = (s_src != SRC_LATCHED);
                 s_latched_kg       = load;
                 s_latched_measured = s_stand_ok_measured;
@@ -165,7 +193,15 @@ void payloadUpdate(void)
 
     /* --- handle TRIPLE CLICK = manual load-detect zero (tipped back only) --- */
     uint32_t first_click;
-    if (deadmanTakeTripleClick(&first_click)) loadcellZeroFromHandle(first_click);
+    if (deadmanTakeTripleClick(&first_click) && loadcellZeroFromHandle(first_click)) {
+        /* zeroed (tipped back, plate empty): the accepted load is no longer
+         * known - back to the MANUAL load until the next upright reading / click */
+        s_src         = SRC_MANUAL;
+        s_manual_lock = false;
+        uart_printf("PAYLOAD: scale zeroed - load back to MANUAL %.1f kg -> assist payload %.1f kg (%.2f x).\r\n",
+                    (double)s_manual_kg, (double)payloadGetKg(), (double)payloadAssistScale());
+        push_to_observer();
+    }
 
     /* --- one click = accept the most recent load; two clicks = hint --- */
     uint8_t n = deadmanTakeShortClicks();
@@ -238,8 +274,9 @@ void payloadAdjustManual(float delta_kg)
     /* Start from the value in use, so a press nudges a latched value. */
     s_manual_kg = clamp_manual(payloadGetLoadKg() + delta_kg);
     s_src = SRC_MANUAL;
-    uart_printf("PAYLOAD: load %.0f kg (manual) -> assist payload %.1f kg\r\n",
-                (double)s_manual_kg, (double)payloadGetKg());
+    s_manual_lock = true;                      /* operator override: pause the auto-read */
+    uart_printf("PAYLOAD: load %.0f kg (manual) -> assist payload %.1f kg (%.2f x)\r\n",
+                (double)s_manual_kg, (double)payloadGetKg(), (double)payloadAssistScale());
     push_to_observer();
 }
 
@@ -247,11 +284,14 @@ void payloadSetManual(float kg)
 {
     s_manual_kg = clamp_manual(kg);
     s_src = SRC_MANUAL;
+    s_manual_lock = true;                      /* operator override: pause the auto-read */
+    uart_print("PAYLOAD: manual load - automatic reading paused until 'W A', a handle click or a restart.\r\n");
     push_to_observer();
 }
 
 bool payloadUseLatched(void)
 {
+    s_manual_lock = false;                     /* back to the scale */
     if (!s_have_latch) return false;
     s_src = SRC_LATCHED;
     push_to_observer();
@@ -262,7 +302,7 @@ void payloadPrintStatus(void)
 {
     uart_printf("Load: %.1f kg (%s) -> assist payload %.1f kg (%.2f x)  |  effective cart mass: %.1f kg\r\n",
                 (double)payloadGetLoadKg(), s_src == SRC_LATCHED ? "ACCEPTED from load detection" : "MANUAL",
-                (double)payloadGetKg(), (double)LOAD_ASSIST_SCALE, (double)observerGetMassKg());
+                (double)payloadGetKg(), (double)payloadAssistScale(), (double)observerGetMassKg());
     if (s_have_latch)
         uart_printf("  last accepted: load %.1f kg (measured %.1f kg)\r\n",
                     (double)s_latched_kg, (double)s_latched_measured);

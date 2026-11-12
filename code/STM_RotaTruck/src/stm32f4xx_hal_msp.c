@@ -20,6 +20,26 @@ void HAL_MspInit(void)
  * =====================================================================*/
 void HAL_I2C_MspInit(I2C_HandleTypeDef *hi2c)
 {
+#if LCD_I2C_SEPARATE_BUS
+    /* LCD on its own bus: I2C3, SCL PA8 / SDA PC9.  NO internal pull-ups -
+     * the backpack pulls the lines to 5 V (FT pins, internal pulls must be
+     * off above VDD). */
+    if (hi2c->Instance == LCD_I2C_INSTANCE) {
+        __HAL_RCC_GPIOA_CLK_ENABLE();
+        __HAL_RCC_GPIOC_CLK_ENABLE();
+        GPIO_InitTypeDef l = {0};
+        l.Mode      = GPIO_MODE_AF_OD;
+        l.Pull      = GPIO_NOPULL;
+        l.Speed     = GPIO_SPEED_FREQ_HIGH;
+        l.Alternate = LCD_I2C_GPIO_AF;
+        l.Pin = LCD_I2C_SCL_PIN; HAL_GPIO_Init(LCD_I2C_SCL_PORT, &l);
+        l.Pin = LCD_I2C_SDA_PIN; HAL_GPIO_Init(LCD_I2C_SDA_PORT, &l);
+        __HAL_RCC_I2C3_CLK_ENABLE();
+        __HAL_RCC_I2C3_FORCE_RESET();
+        __HAL_RCC_I2C3_RELEASE_RESET();
+        return;
+    }
+#endif
     if (hi2c->Instance != IMU_I2C_INSTANCE) return;
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
@@ -41,6 +61,9 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef *hi2c)
 
 void HAL_I2C_MspDeInit(I2C_HandleTypeDef *hi2c)
 {
+#if LCD_I2C_SEPARATE_BUS
+    if (hi2c->Instance == LCD_I2C_INSTANCE) { __HAL_RCC_I2C3_CLK_DISABLE(); return; }
+#endif
     if (hi2c->Instance != IMU_I2C_INSTANCE) return;
     __HAL_RCC_I2C1_CLK_DISABLE();
 }

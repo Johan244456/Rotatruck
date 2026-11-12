@@ -2,6 +2,7 @@
 #define LCD_I2C_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,6 +23,9 @@ extern "C" {
 
 bool lcdBegin(void);
 bool lcdIsPresent(void);
+uint8_t lcdAddress(void);                      /* 7-bit address in use, 0 if none */
+/* Console `LCD`: bus pin levels / BUSY, then every address that answers. */
+void lcdDiagnose(void (*print)(const char *));
 
 /* Set the desired two lines (each shown left-justified, padded/truncated
  * to 16 chars).  Cheap: only flags a refresh if the content changed. */
